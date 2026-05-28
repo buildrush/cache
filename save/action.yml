@@ -1,0 +1,33 @@
+name: 'Build_Rush Cache (save)'
+description: 'Drop-in replacement for actions/cache/save@v5 backed by Build_Rush. Save only.'
+branding:
+  icon: archive
+  color: purple
+inputs:
+  path:
+    description: 'A list of files, directories, and wildcard patterns to cache'
+    required: true
+  key:
+    description: 'An explicit key for saving the cache'
+    required: true
+  upload-chunk-size:
+    description: 'The chunk size used to split up large files during upload, in bytes'
+    required: false
+  enableCrossOsArchive:
+    description: 'An optional boolean when enabled, allows windows runners to save caches that can be restored on other platforms'
+    default: 'false'
+    required: false
+  audience:
+    description: 'OIDC audience to mint. Defaults to https://cache.buildrush.io (production cache service).'
+    required: false
+    default: 'https://cache.buildrush.io'
+  fallback:
+    description: 'Build_Rush fallback policy when cache service is unavailable: github (default) | skip | fail.'
+    required: false
+    default: 'github'
+outputs:
+  buildrush-reason:
+    description: 'Build_Rush fallback reason code (empty string if the cache service was reached successfully).'
+runs:
+  using: 'node24'
+  main: '../dist/save/index.js'

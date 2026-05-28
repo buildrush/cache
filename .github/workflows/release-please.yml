@@ -1,0 +1,35 @@
+name: release-please
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: googleapis/release-please-action@v5
+        id: release
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Checkout for major tag update
+        if: ${{ steps.release.outputs.release_created }}
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push floating major tag
+        if: ${{ steps.release.outputs.release_created }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          TAG="${{ steps.release.outputs.tag_name }}"
+          MAJOR=$(echo "$TAG" | cut -d. -f1)
+          git tag -f "$MAJOR" "$TAG"
+          git push -f origin "$MAJOR"

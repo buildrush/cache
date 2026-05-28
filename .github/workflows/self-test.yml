@@ -1,0 +1,420 @@
+name: self-test
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  build-dist:
+    name: Build dist for testing
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with: { node-version: 24, cache: npm }
+      - run: npm ci
+      - run: npm run build
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-bundle
+          path: dist
+
+  combined-roundtrip-write:
+    name: Combined — write
+    needs: build-dist
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - name: Seed payload
+        env:
+          RUN_ID: ${{ github.run_id }}
+        run: mkdir -p /tmp/br-payload && echo "marker-$RUN_ID" > /tmp/br-payload/stamp
+      - id: action
+        uses: ./
+        env:
+          BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}
+        with:
+          audience: https://cache.buildrush.dev
+          key: self-test-combined-${{ github.run_id }}
+          path: /tmp/br-payload
+      - name: Assert first-run miss
+        env:
+          REASON: ${{ steps.action.outputs.buildrush-reason }}
+          HIT: ${{ steps.action.outputs.cache-hit }}
+        run: |
+          test -z "$REASON" || (echo "expected empty reason, got $REASON" && exit 1)
+          test "$HIT" = "false" || (echo "expected first-run miss, got hit=$HIT" && exit 1)
+
+  combined-roundtrip-read:
+    name: Combined — read
+    needs: combined-roundtrip-write
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - id: action
+        uses: ./
+        env:
+          BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}
+        with:
+          audience: https://cache.buildrush.dev
+          key: self-test-combined-${{ github.run_id }}
+          path: /tmp/br-payload
+      - name: Assert hit and bytes match
+        env:
+          REASON: ${{ steps.action.outputs.buildrush-reason }}
+          HIT: ${{ steps.action.outputs.cache-hit }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          test -z "$REASON" || (echo "expected empty reason, got $REASON" && exit 1)
+          test "$HIT" = "true" || (echo "expected second-run hit, got hit=$HIT" && exit 1)
+          test -f /tmp/br-payload/stamp || (echo "restored payload missing" && exit 1)
+          grep -q "marker-$RUN_ID" /tmp/br-payload/stamp \
+            || (echo "restored payload bytes do not match what was saved" && exit 1)
+
+  split-roundtrip:
+    name: Split — restore→save→restore
+    needs: build-dist
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+
+      # 1) First restore: expect miss
+      - id: restore-1
+        uses: ./restore
+        env:
+          BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}
+        with:
+          audience: https://cache.buildrush.dev
+          key: self-test-split-${{ github.run_id }}
+          path: /tmp/br-split-payload
+      - name: Assert first restore is a miss
+        env:
+          REASON: ${{ steps.restore-1.outputs.buildrush-reason }}
+          HIT: ${{ steps.restore-1.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-1.outputs.cache-matched-key }}
+          PK: ${{ steps.restore-1.outputs.cache-primary-key }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          test -z "$REASON" || (echo "reason=$REASON" && exit 1)
+          test "$HIT" = "false" || (echo "hit=$HIT" && exit 1)
+          test -z "$MATCHED" || (echo "matched=$MATCHED" && exit 1)
+          test "$PK" = "self-test-split-$RUN_ID" || (echo "pk=$PK" && exit 1)
+
+      # 2) Create payload and save
+      - name: Seed payload
+        env:
+          RUN_ID: ${{ github.run_id }}
+        run: mkdir -p /tmp/br-split-payload && echo "split-marker-$RUN_ID" > /tmp/br-split-payload/stamp
+      - id: save
+        uses: ./save
+        env:
+          BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}
+        with:
+          audience: https://cache.buildrush.dev
+          key: self-test-split-${{ github.run_id }}
+          path: /tmp/br-split-payload
+      - name: Assert save reason empty
+        env:
+          REASON: ${{ steps.save.outputs.buildrush-reason }}
+        run: |
+          test -z "$REASON" || (echo "reason=$REASON" && exit 1)
+
+      # 3) Wipe local payload, restore again, assert hit + bytes match
+      - run: rm -rf /tmp/br-split-payload
+      - id: restore-2
+        uses: ./restore
+        env:
+          BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}
+        with:
+          audience: https://cache.buildrush.dev
+          key: self-test-split-${{ github.run_id }}
+          path: /tmp/br-split-payload
+      - name: Assert second restore is a hit with matching bytes
+        env:
+          REASON: ${{ steps.restore-2.outputs.buildrush-reason }}
+          HIT: ${{ steps.restore-2.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-2.outputs.cache-matched-key }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          test -z "$REASON" || (echo "reason=$REASON" && exit 1)
+          test "$HIT" = "true" || (echo "hit=$HIT" && exit 1)
+          test "$MATCHED" = "self-test-split-$RUN_ID" || (echo "matched=$MATCHED" && exit 1)
+          test -f /tmp/br-split-payload/stamp || (echo "restored payload missing" && exit 1)
+          grep -q "split-marker-$RUN_ID" /tmp/br-split-payload/stamp \
+            || (echo "restored payload bytes do not match what was saved" && exit 1)
+
+  large-write-restore:
+    name: Large — write+restore (200 MiB)
+    needs: build-dist
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - name: Seed 200 MiB payload
+        env:
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          mkdir -p /tmp/br-large-payload
+          dd if=/dev/urandom of=/tmp/br-large-payload/data bs=1M count=200 status=none
+          echo "marker-${RUN_ID}" > /tmp/br-large-payload/stamp
+      - name: Save 200 MiB cache
+        uses: ./save
+        env:
+          BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}
+        with:
+          audience: https://cache.buildrush.dev
+          key: self-test-large-${{ github.run_id }}
+          path: /tmp/br-large-payload
+      - name: Remove the source files
+        run: rm -rf /tmp/br-large-payload
+      - name: Restore 200 MiB cache
+        id: restore
+        uses: ./restore
+        env:
+          BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}
+        with:
+          audience: https://cache.buildrush.dev
+          key: self-test-large-${{ github.run_id }}
+          path: /tmp/br-large-payload
+      - name: Assert restore is a hit with matching bytes
+        env:
+          HIT: ${{ steps.restore.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore.outputs.cache-matched-key }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          test "$HIT" = "true" || (echo "expected hit, got $HIT" && exit 1)
+          test "$MATCHED" = "self-test-large-${RUN_ID}" || (echo "matched=$MATCHED" && exit 1)
+          test -f /tmp/br-large-payload/stamp || (echo "stamp missing" && exit 1)
+          grep -q "marker-${RUN_ID}" /tmp/br-large-payload/stamp \
+            || (echo "stamp content mismatch" && exit 1)
+          actual_size=$(stat -c%s /tmp/br-large-payload/data)
+          test "$actual_size" -eq "209715200" || (echo "size mismatch: $actual_size" && exit 1)
+
+  large-chunked-download:
+    name: Large — chunked download
+    needs: large-write-restore
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - name: Fresh restore of the key seeded by large-write-restore
+        id: restore
+        uses: ./restore
+        env:
+          BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}
+        with:
+          audience: https://cache.buildrush.dev
+          key: self-test-large-${{ github.run_id }}
+          path: /tmp/br-large-payload
+      - name: Assert restore worked + bytes match
+        env:
+          HIT: ${{ steps.restore.outputs.cache-hit }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          test "$HIT" = "true" || (echo "expected hit" && exit 1)
+          test -f /tmp/br-large-payload/stamp || (echo "stamp missing" && exit 1)
+          grep -q "marker-${RUN_ID}" /tmp/br-large-payload/stamp \
+            || (echo "stamp content mismatch" && exit 1)
+
+  oidc-mint-failed:
+    needs: build-dist
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read   # deliberately NO id-token: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - id: action
+        uses: ./
+        with:
+          key: self-test-${{ github.run_id }}
+          path: /tmp/self-test-payload
+      - name: Assert oidc-mint-failed reason
+        env:
+          REASON: ${{ steps.action.outputs.buildrush-reason }}
+        run: |
+          test "$REASON" = "oidc-mint-failed" || (echo "got reason: $REASON" && exit 1)
+
+  network-error:
+    needs: build-dist
+    runs-on: ubuntu-latest
+    permissions: { id-token: write, contents: read }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - id: action
+        uses: ./
+        env:
+          BUILDRUSH_CACHE_URL: http://127.0.0.1:1
+        with:
+          key: self-test-${{ github.run_id }}
+          path: /tmp/self-test-payload
+      - name: Assert network-error reason
+        env:
+          REASON: ${{ steps.action.outputs.buildrush-reason }}
+        run: |
+          test "$REASON" = "network-error" || (echo "got reason: $REASON" && exit 1)
+
+  oidc-rejected:
+    needs: build-dist
+    runs-on: ubuntu-latest
+    permissions: { id-token: write, contents: read }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - id: action
+        uses: ./
+        env:
+          # BR-713 contract: staging endpoint responds to ?force-status=NNN
+          BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}?force-status=401
+        with:
+          audience: https://cache.buildrush.dev
+          key: self-test-${{ github.run_id }}
+          path: /tmp/self-test-payload
+      - name: Assert oidc-rejected reason
+        env:
+          REASON: ${{ steps.action.outputs.buildrush-reason }}
+        run: |
+          test "$REASON" = "oidc-rejected" || (echo "got reason: $REASON" && exit 1)
+
+  installation-not-enabled:
+    needs: build-dist
+    runs-on: ubuntu-latest
+    permissions: { id-token: write, contents: read }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - id: action
+        uses: ./
+        env:
+          BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}?force-status=403
+        with:
+          audience: https://cache.buildrush.dev
+          key: self-test-${{ github.run_id }}
+          path: /tmp/self-test-payload
+      - name: Assert installation-not-enabled reason
+        env:
+          REASON: ${{ steps.action.outputs.buildrush-reason }}
+        run: |
+          test "$REASON" = "installation-not-enabled" || (echo "got reason: $REASON" && exit 1)
+
+  rate-limited:
+    needs: build-dist
+    runs-on: ubuntu-latest
+    permissions: { id-token: write, contents: read }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - id: action
+        uses: ./
+        env:
+          BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}?force-status=429
+        with:
+          audience: https://cache.buildrush.dev
+          key: self-test-${{ github.run_id }}
+          path: /tmp/self-test-payload
+      - name: Assert rate-limited reason
+        env:
+          REASON: ${{ steps.action.outputs.buildrush-reason }}
+        run: |
+          test "$REASON" = "rate-limited" || (echo "got reason: $REASON" && exit 1)
+
+  service-unavailable:
+    needs: build-dist
+    runs-on: ubuntu-latest
+    permissions: { id-token: write, contents: read }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - id: action
+        uses: ./
+        env:
+          BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}?force-status=503
+        with:
+          audience: https://cache.buildrush.dev
+          key: self-test-${{ github.run_id }}
+          path: /tmp/self-test-payload
+      - name: Assert service-unavailable reason
+        env:
+          REASON: ${{ steps.action.outputs.buildrush-reason }}
+        run: |
+          test "$REASON" = "service-unavailable" || (echo "got reason: $REASON" && exit 1)
+
+  fallback-skip:
+    needs: build-dist
+    runs-on: ubuntu-latest
+    permissions: { id-token: write, contents: read }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - id: action
+        uses: ./
+        env:
+          BUILDRUSH_CACHE_URL: http://127.0.0.1:1
+        with:
+          key: self-test-${{ github.run_id }}
+          path: /tmp/self-test-payload
+          fallback: skip
+      - name: Assert skip fallback applied
+        env:
+          REASON: ${{ steps.action.outputs.buildrush-reason }}
+        run: |
+          test "$REASON" = "network-error" || (echo "got reason: $REASON" && exit 1)
+          test "$ACTIONS_CACHE_DISABLED" = "true" || (echo "expected ACTIONS_CACHE_DISABLED=true after skip fallback" && exit 1)
+
+  fallback-fail:
+    needs: build-dist
+    runs-on: ubuntu-latest
+    permissions: { id-token: write, contents: read }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - id: action
+        continue-on-error: true
+        uses: ./
+        env:
+          BUILDRUSH_CACHE_URL: http://127.0.0.1:1
+        with:
+          key: self-test-${{ github.run_id }}
+          path: /tmp/self-test-payload
+          fallback: fail
+      - name: Assert fail fallback applied
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+          REASON: ${{ steps.action.outputs.buildrush-reason }}
+        run: |
+          test "$OUTCOME" = "failure" || (echo "expected action step to fail with fallback: fail" && exit 1)
+          test "$REASON" = "network-error" || (echo "got reason: $REASON" && exit 1)

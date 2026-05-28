@@ -1,0 +1,154 @@
+// Thin REST client for the Build_Rush cache service. Wraps fetch() with
+// JSON encoding, Bearer-token auth, and error envelope parsing. Each
+// public method is wrapped in withRetry() so transient failures (5xx,
+// 429, network errors — anything CacheClientError marks retryable=true)
+// are retried with exponential backoff before bubbling to the caller.
+
+import { withRetry } from "../retry/retry.js";
+import type {
+  CreateRequest,
+  CreateResponse,
+  ErrorEnvelope,
+  FinalizeRequest,
+  LookupRequest,
+  LookupResponse,
+} from "../types.js";
+
+export class CacheClientError extends Error {
+  public override readonly name = "CacheClientError";
+  constructor(
+    message: string,
+    public readonly status: number,
+    public readonly code: string,
+    public readonly retryable: boolean,
+    public readonly details?: Record<string, unknown>,
+  ) {
+    super(message);
+  }
+}
+
+const DEFAULT_BASE_DELAY_MS = 200;
+
+export interface CacheClientOptions {
+  /** Override fetch for tests. */
+  fetchImpl?: typeof fetch;
+  /** Override retry base delay in milliseconds. Defaults to 200; tests typically pass 1 to keep the suite fast. */
+  baseDelayMs?: number;
+}
+
+export interface LookupHit {
+  downloadUrl: string;
+  matchedKey: string;
+}
+
+export class CacheClient {
+  private readonly fetchImpl: typeof fetch;
+  private readonly retryOpts: {
+    maxAttempts: number;
+    baseDelayMs: number;
+    isRetryable: (err: unknown) => boolean;
+  };
+
+  constructor(
+    private readonly baseUrl: string,
+    private readonly token: string,
+    opts: CacheClientOptions = {},
+  ) {
+    this.fetchImpl = opts.fetchImpl ?? globalThis.fetch;
+    this.retryOpts = {
+      maxAttempts: 3,
+      baseDelayMs: opts.baseDelayMs ?? DEFAULT_BASE_DELAY_MS,
+      isRetryable: (err: unknown) =>
+        err instanceof CacheClientError && err.retryable,
+    };
+  }
+
+  /** POST /api/cache/entries → returns the uploadUrl on success. */
+  async createEntry(req: CreateRequest): Promise<string> {
+    return withRetry(async () => {
+      const resp = await this.post("/api/cache/entries", req);
+      const body = (await resp.json()) as CreateResponse;
+      if (!body || typeof body.uploadUrl !== "string" || body.uploadUrl === "") {
+        throw new CacheClientError(
+          "create response missing uploadUrl",
+          resp.status,
+          "PROTOCOL_ERROR",
+          false,
+        );
+      }
+      return body.uploadUrl;
+    }, this.retryOpts);
+  }
+
+  /** POST /api/cache/entries/finalize → resolves on 204. */
+  async finalizeEntry(req: FinalizeRequest): Promise<void> {
+    await withRetry(async () => {
+      await this.post("/api/cache/entries/finalize", req, { expectStatus: 204 });
+    }, this.retryOpts);
+  }
+
+  /** POST /api/cache/entries/lookup → returns the hit or null on miss. */
+  async lookupEntry(req: LookupRequest): Promise<LookupHit | null> {
+    return withRetry(async () => {
+      const resp = await this.post("/api/cache/entries/lookup", req);
+      const body = (await resp.json()) as LookupResponse;
+      if (!body.downloadUrl) return null;
+      return { downloadUrl: body.downloadUrl, matchedKey: body.matchedKey ?? "" };
+    }, this.retryOpts);
+  }
+
+  private async post(
+    path: string,
+    body: unknown,
+    opts: { expectStatus?: number } = {},
+  ): Promise<Response> {
+    let resp: Response;
+    try {
+      resp = await this.fetchImpl(`${this.baseUrl}${path}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${this.token}`,
+        },
+        body: JSON.stringify(body),
+      });
+    } catch (err) {
+      throw new CacheClientError(
+        `network error: ${(err as Error).message}`,
+        0,
+        "NETWORK_ERROR",
+        true,
+      );
+    }
+
+    if (opts.expectStatus !== undefined) {
+      if (resp.status !== opts.expectStatus) {
+        await this.throwFromResponse(resp);
+      }
+      return resp;
+    }
+    if (!resp.ok) {
+      await this.throwFromResponse(resp);
+    }
+    return resp;
+  }
+
+  private async throwFromResponse(resp: Response): Promise<never> {
+    let envelope: ErrorEnvelope | null = null;
+    try {
+      envelope = (await resp.json()) as ErrorEnvelope;
+    } catch {
+      envelope = null;
+    }
+    const code = envelope?.error?.code ?? "UNKNOWN_ERROR";
+    const message = envelope?.error?.message ?? `cache service: ${resp.status}`;
+    const retryable = resp.status >= 500 || resp.status === 429;
+    throw new CacheClientError(
+      message,
+      resp.status,
+      code,
+      retryable,
+      envelope?.error?.details,
+    );
+  }
+}

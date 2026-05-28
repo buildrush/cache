@@ -1,0 +1,28 @@
+{
+  "name": "buildrush-cache-action",
+  "version": "1.0.0",
+  "description": "Drop-in replacement for actions/cache@v5 backed by Build_Rush.",
+  "private": true,
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "build": "ncc build restore/src/index.ts -o dist/restore --minify --license licenses.txt && ncc build save/src/index.ts -o dist/save --minify --license licenses.txt",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "eslint src __tests__ restore/src save/src --no-error-on-unmatched-pattern",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@actions/core": "^3.0.1",
+    "tar": "^7.5.15"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@vercel/ncc": "^0.38.4",
+    "eslint": "^10.4.0",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.59.4",
+    "vitest": "^4.1.7"
+  }
+}
