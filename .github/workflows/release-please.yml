@@ -8,12 +8,74 @@ permissions:
   contents: write
   pull-requests: write
 
+# Shares the concurrency group with build-dist-on-main.yml so the two
+# workflows serialize on every push to main. With cancel-in-progress: false,
+# GitHub queues the second workflow as pending and replaces any older pending
+# run with the newer trigger — guaranteeing release-please always rebases the
+# open release PR onto the latest main, including any dist commit
+# build-dist-on-main just pushed.
+concurrency:
+  group: main-release-flow
+  cancel-in-progress: false
+
 jobs:
   release:
     runs-on: ubuntu-latest
     steps:
       - uses: googleapis/release-please-action@v5
         id: release
+
+      # Belt-and-suspenders: rebuild dist on the open release PR's branch in
+      # the same workflow run that rebased the PR. Closes the human-merge race
+      # where someone could merge the release PR during the build-dist-on-main
+      # window and end up with a tag whose tree lacks dist. Runs whenever
+      # release-please-action reports an open release PR (created or updated
+      # this run).
+      # Defensive validation of the branch name before using it as a checkout
+      # ref. release-please-action's outputs.pr is trusted (Google-maintained
+      # action, branch name generated from our own release-please config), but
+      # we validate the pattern explicitly so a future change in the action's
+      # output schema can't sneak an unexpected ref into actions/checkout.
+      - name: Validate release PR branch name
+        if: ${{ steps.release.outputs.pr }}
+        env:
+          PR_BRANCH_RAW: ${{ fromJson(steps.release.outputs.pr).headBranchName }}
+        run: |
+          if [[ ! "$PR_BRANCH_RAW" =~ ^release-please-- ]]; then
+            echo "::error::Unexpected release PR branch name: $PR_BRANCH_RAW"
+            exit 1
+          fi
+          echo "PR_BRANCH=$PR_BRANCH_RAW" >> "$GITHUB_ENV"
+
+      - name: Checkout release PR branch
+        if: ${{ steps.release.outputs.pr }}
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.PR_BRANCH }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          persist-credentials: true
+
+      - name: Setup Node
+        if: ${{ steps.release.outputs.pr }}
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Build dist and commit if changed
+        if: ${{ steps.release.outputs.pr }}
+        run: |
+          npm ci
+          npm run build
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add dist
+          if git diff --staged --quiet -- dist; then
+            echo "dist on release PR branch is already up to date"
+            exit 0
+          fi
+          git commit -m "chore(dist): rebuild dist for release"
+          git push
 
       - name: Checkout for major tag update
         if: ${{ steps.release.outputs.release_created }}

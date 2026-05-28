@@ -1,22 +1,35 @@
-name: release-prep
+name: build-dist
 
 on:
-  pull_request:
+  push:
     branches: [main]
-    types: [opened, synchronize, reopened]
+    paths:
+      - 'src/**'
+      - 'restore/src/**'
+      - 'save/src/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'tsconfig.json'
 
 permissions:
   contents: write
-  pull-requests: write
+
+# Share the concurrency group with release-please so the two workflows
+# serialize on every push to main. With cancel-in-progress: false, GitHub
+# queues the second workflow as pending; if a newer push arrives mid-flight
+# the older pending run is cancelled and replaced — so release-please always
+# runs against the latest main, including the dist commit this workflow just
+# pushed.
+concurrency:
+  group: main-release-flow
+  cancel-in-progress: false
 
 jobs:
   build-dist:
-    if: startsWith(github.head_ref, 'release-please--')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.head_ref }}
           token: ${{ secrets.GITHUB_TOKEN }}
           persist-credentials: true
 
@@ -26,6 +39,8 @@ jobs:
           cache: npm
 
       - run: npm ci
+
+      - run: npm test
 
       - run: npm run build
 
@@ -38,5 +53,5 @@ jobs:
             echo "dist tree is already up to date — nothing to commit"
             exit 0
           fi
-          git commit -m "chore: rebuild dist for release"
+          git commit -m "chore(dist): rebuild dist [skip ci]"
           git push
