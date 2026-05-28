@@ -1,0 +1,15 @@
+node_modules/
+build/
+coverage/
+*.log
+*.tsbuildinfo
+.DS_Store
+.env
+.env.local
+.idea/
+.claude/
+!.claude/settings.local.json
+docs/superpowers/
+
+# dist/ is intentionally tracked (managed by the release-prep workflow on release-please PR branches).
+# Do not add a dist/ pattern here — it would suppress the bot-managed bundle.

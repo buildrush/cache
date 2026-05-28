@@ -1,0 +1,51 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 10
+    versioning-strategy: increase
+    labels:
+      - dependencies
+      - npm
+    commit-message:
+      prefix: fix
+      prefix-development: chore
+      include: scope
+    groups:
+      actions-runtime:
+        patterns:
+          - "@actions/*"
+      dev-deps:
+        dependency-type: development
+        exclude-patterns:
+          - "@types/node"
+    ignore:
+      # Node runtime is pinned to 24 (action.yml uses `using: node24`).
+      # @types/node majors must be bumped manually when we move the runtime.
+      - dependency-name: "@types/node"
+        update-types:
+          - version-update:semver-major
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 10
+    labels:
+      - dependencies
+      - github-actions
+    commit-message:
+      prefix: chore
+      include: scope
+    groups:
+      github-actions-deps:
+        patterns:
+          - "*"
