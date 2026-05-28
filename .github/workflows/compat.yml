@@ -22,8 +22,6 @@ on:
       - 'restore/action.yml'
       - 'save/action.yml'
       - '.github/workflows/compat.yml'
-  push:
-    branches: [main]
 
 concurrency:
   group: compat-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
