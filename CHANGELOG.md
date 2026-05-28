@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.1](https://github.com/buildrush/cache/compare/v1.1.0...v1.1.1) (2026-05-28)
+
+
+### Bug Fixes
+
+* **release-pipeline:** jq-parse outputs.pr in shell + add PR-level build-dist check ([#7](https://github.com/buildrush/cache/issues/7)) ([38269f7](https://github.com/buildrush/cache/commit/38269f760dde20710131665e4a8cb2a5a78721f6))
+
 ## [1.1.0](https://github.com/buildrush/cache/compare/v1.0.0...v1.1.0) (2026-05-28)
 
 
