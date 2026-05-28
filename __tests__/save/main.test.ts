@@ -9,6 +9,13 @@ import { putSingleShot, putChunked } from "../../src/transport/upload.js";
 import { createTarStream } from "../../src/archive/tar.js";
 import { compressStream } from "../../src/archive/compress.js";
 
+// Pin os.homedir for the tilde-expansion test below; spread `actual` so
+// os.tmpdir() (used by save/src/main.ts) still returns a real path.
+vi.mock("node:os", async () => {
+  const actual = await vi.importActual<typeof import("node:os")>("node:os");
+  return { ...actual, homedir: () => "/home/runner" };
+});
+
 vi.mock("@actions/core");
 vi.mock("../../src/auth/exchange.js");
 vi.mock("../../src/transport/upload.js", async () => {
@@ -396,6 +403,29 @@ describe("save main.run() — archive + upload + finalize", () => {
       ["dir-a", "dir-b"],
       "zstd",
       true,
+    );
+  });
+
+  it("expands `~` for the tar pack but keeps the literal string for computeCacheVersion", async () => {
+    multilineInputs["path"] = ["~/.cache/go-build", "/abs/foo"];
+    vi.mocked(mintAndExchange).mockResolvedValue({ token: "tok" });
+    cacheClientHoist.createEntry.mockResolvedValue("https://up/abc");
+    cacheClientHoist.finalizeEntry.mockResolvedValue(undefined);
+
+    await run();
+
+    // Literal `~/...` preserved so the digest stays stable across runners
+    // with different $HOME (see src/archive/version.ts).
+    expect(computeCacheVersion).toHaveBeenCalledWith(
+      ["~/.cache/go-build", "/abs/foo"],
+      "zstd",
+      false,
+    );
+    // node-tar receives the expanded absolute path so it can resolve the
+    // source directory; non-tilde paths pass through unchanged.
+    expect(createTarStream).toHaveBeenCalledWith(
+      ["/home/runner/.cache/go-build", "/abs/foo"],
+      expect.any(String),
     );
   });
 
