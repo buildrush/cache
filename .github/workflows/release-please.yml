@@ -36,16 +36,27 @@ jobs:
       # action, branch name generated from our own release-please config), but
       # we validate the pattern explicitly so a future change in the action's
       # output schema can't sneak an unexpected ref into actions/checkout.
+      #
+      # CRITICAL: pass the raw outputs.pr value (a JSON string when a release
+      # PR exists, empty when no PR exists) through env and parse with jq
+      # inside the script. A previous version used fromJson() directly in the
+      # env expression — GitHub Actions evaluates env expressions eagerly,
+      # before the step's if: gate. On the release_created path, outputs.pr
+      # is empty; fromJson(empty) failed the step with "Error reading JToken
+      # from JsonReader" and short-circuited the workflow (skipping the
+      # floating major tag push). Parsing on the shell side only runs when
+      # the if: evaluates true, so empty input is impossible.
       - name: Validate release PR branch name
         if: ${{ steps.release.outputs.pr }}
         env:
-          PR_BRANCH_RAW: ${{ fromJson(steps.release.outputs.pr).headBranchName }}
+          PR_OUTPUT: ${{ steps.release.outputs.pr }}
         run: |
-          if [[ ! "$PR_BRANCH_RAW" =~ ^release-please-- ]]; then
-            echo "::error::Unexpected release PR branch name: $PR_BRANCH_RAW"
+          branch=$(printf '%s' "$PR_OUTPUT" | jq -r '.headBranchName')
+          if [[ ! "$branch" =~ ^release-please-- ]]; then
+            echo "::error::Unexpected release PR branch name: $branch"
             exit 1
           fi
-          echo "PR_BRANCH=$PR_BRANCH_RAW" >> "$GITHUB_ENV"
+          echo "PR_BRANCH=$branch" >> "$GITHUB_ENV"
 
       - name: Checkout release PR branch
         if: ${{ steps.release.outputs.pr }}

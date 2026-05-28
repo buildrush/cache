@@ -1,5 +1,9 @@
 name: build-dist
 
+# Triggers on both push to main (commit dist if changed) AND pull_request
+# (dry-run: build, report whether dist would change, but never commit). The
+# PR variant validates the workflow itself plus catches broken builds at
+# review time; the push variant performs the actual dist update.
 on:
   push:
     branches: [main]
@@ -10,6 +14,15 @@ on:
       - 'package.json'
       - 'package-lock.json'
       - 'tsconfig.json'
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'restore/src/**'
+      - 'save/src/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'tsconfig.json'
+      - '.github/workflows/build-dist-on-main.yml'
 
 permissions:
   contents: write
@@ -45,6 +58,7 @@ jobs:
       - run: npm run build
 
       - name: Commit dist if changed
+        if: github.event_name == 'push'
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
@@ -55,3 +69,14 @@ jobs:
           fi
           git commit -m "chore(dist): rebuild dist [skip ci]"
           git push
+
+      - name: Verify dist coherence (PR dry-run)
+        if: github.event_name == 'pull_request'
+        run: |
+          git add dist
+          if git diff --staged --quiet -- dist; then
+            echo "PR doesn't change dist — coherent with current main ✓"
+          else
+            echo "PR would update dist when merged. Preview:"
+            git diff --staged --stat -- dist
+          fi
