@@ -16,6 +16,15 @@ import { compressStream } from "../../src/archive/compress.js";
 import { expandHomeTilde } from "../../src/archive/paths.js";
 import { createTarStream } from "../../src/archive/tar.js";
 import { chooseUploadMode, putSingleShot, putChunked } from "../../src/transport/upload.js";
+import { CountingPassThrough } from "../../src/archive/counting.js";
+import {
+  formatBytes,
+  formatDuration,
+  formatRatio,
+  formatSpeed,
+  shortVersion,
+} from "../../src/log/format.js";
+import { Timer } from "../../src/log/timer.js";
 
 const SUCCESS_NOTICE = "Build_Rush cache authenticated";
 const DEFAULT_BASE_URL = "https://cache.buildrush.io";
@@ -86,14 +95,17 @@ export async function run(): Promise<void> {
   // 2. Archive — tar + zstd to a tempfile.
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "br-save-"));
   const archivePath = path.join(tmpDir, "cache.tar.zst");
+  let counter: CountingPassThrough | undefined;
   try {
     const outHandle = await fs.open(archivePath, "w");
     try {
       // Expand `~` so node-tar can find the source dirs. `paths` itself
       // stays literal so computeCacheVersion's digest remains stable
       // across runners (see src/archive/version.ts header comment).
+      counter = new CountingPassThrough();
       await pipeline(
         createTarStream(expandHomeTilde(paths), process.cwd()),
+        counter,
         compressStream(),
         outHandle.createWriteStream(),
       );
@@ -108,7 +120,9 @@ export async function run(): Promise<void> {
     const baseUrl = process.env.BUILDRUSH_CACHE_URL || DEFAULT_BASE_URL;
     const client = new CacheClient(baseUrl, token);
     const version = computeCacheVersion(paths, "zstd", enableCrossOsArchive);
+    core.info(`Cache version: ${shortVersion(version)}`);
 
+    core.info(`Reserving cache for key: ${primaryKey}`);
     let uploadUrl: string;
     try {
       uploadUrl = await client.createEntry({
@@ -134,16 +148,30 @@ export async function run(): Promise<void> {
       return;
     }
 
+    const uncompressedBytes = counter?.bytes ?? 0;
+    const ratio = formatRatio(uncompressedBytes, sizeBytes);
+    const ratioTail = ratio === "" ? "" : `, ${ratio}`;
+    core.info(
+      `Cache size: ${formatBytes(sizeBytes)} compressed (${formatBytes(uncompressedBytes)} uncompressed${ratioTail})`,
+    );
+
     // 4. Upload the archive — streamed from disk to keep memory bounded.
     // Transport is selected by URL shape returned by the cache service: a
     // GCS resumable session URI (upload_id=...) uses chunked PUT; a signed
     // PUT URL uses single-shot. See chooseUploadMode for details.
     try {
+      const uploadTimer = new Timer();
       if (chooseUploadMode(uploadUrl) === "chunked") {
         await putChunked(uploadUrl, archivePath, sizeBytes, chunkSize);
       } else {
         await putSingleShot(uploadUrl, archivePath, sizeBytes);
       }
+      const uploadMs = uploadTimer.elapsedMs();
+      const speed = formatSpeed(sizeBytes, uploadMs);
+      const uploadTail = speed === "" ? "" : ` (${speed})`;
+      core.info(
+        `Uploaded ${formatBytes(sizeBytes)} in ${formatDuration(uploadMs)}${uploadTail}`,
+      );
     } catch (err) {
       core.warning(`Failed to upload cache: ${(err as Error).message}`);
       return;
@@ -156,6 +184,7 @@ export async function run(): Promise<void> {
         version,
         sizeBytes,
       });
+      core.info(`Cache saved successfully (key: ${primaryKey})`);
     } catch (err) {
       const msg =
         err instanceof CacheClientError

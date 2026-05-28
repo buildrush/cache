@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { PassThrough } from "node:stream";
+import * as fs from "node:fs/promises";
 import * as core from "@actions/core";
 import { mintAndExchange } from "../../src/auth/exchange.js";
 import { ExchangeError } from "../../src/auth/types.js";
@@ -24,6 +25,18 @@ vi.mock("../../src/archive/tar.js", () => ({
 vi.mock("../../src/archive/compress.js", () => ({
   decompressStream: vi.fn(() => new PassThrough()),
 }));
+
+const timerHoist = vi.hoisted(() => {
+  const queue: number[] = [];
+  return {
+    queue,
+    Timer: vi.fn(function (this: unknown) {
+      return { elapsedMs: () => (queue.length > 0 ? queue.shift()! : 0) };
+    }),
+  };
+});
+
+vi.mock("../../src/log/timer.js", () => ({ Timer: timerHoist.Timer }));
 
 vi.mock("../../src/archive/version.js", () => ({
   computeCacheVersion: vi.fn(() => "computed-version"),
@@ -66,6 +79,7 @@ vi.mock("node:fs/promises", async () => {
     default: actual,
     mkdtemp: vi.fn(async (prefix: string) => `${prefix}xyz`),
     rm: vi.fn(async () => undefined),
+    stat: vi.fn(async () => ({ size: 12_582_912 })),  // 12 MiB default
     open: vi.fn(async () => {
       const writeable = new PassThrough();
       const readable = new PassThrough();
@@ -89,6 +103,10 @@ const booleanInputs: Record<string, boolean> = {};
 
 beforeEach(() => {
   vi.resetAllMocks();
+  timerHoist.queue.length = 0;
+  timerHoist.Timer.mockImplementation(function (this: unknown) {
+    return { elapsedMs: () => (timerHoist.queue.length > 0 ? timerHoist.queue.shift()! : 0) };
+  });
 
   for (const k of Object.keys(inputs)) delete inputs[k];
   for (const k of Object.keys(multilineInputs)) delete multilineInputs[k];
@@ -126,6 +144,9 @@ beforeEach(() => {
   // Default: download + extract no-op.
   vi.mocked(downloadToFile).mockResolvedValue(undefined);
   vi.mocked(extractTarStream).mockResolvedValue(undefined);
+
+  // Default: stat returns a 12 MiB file size.
+  vi.mocked(fs.stat).mockResolvedValue({ size: 12_582_912 } as Awaited<ReturnType<typeof fs.stat>>);
 });
 
 /**
@@ -436,5 +457,56 @@ describe("restore main.run() — lookup + restore", () => {
       version: "v-explicit",
       restoreKeys: ["rk-1", "rk-2"],
     });
+  });
+});
+
+describe("restore main.run() — verbose logging", () => {
+  it("emits the five hit-path info lines in order", async () => {
+    vi.mocked(mintAndExchange).mockResolvedValue({ token: "tok" });
+    cacheClientHoist.lookupEntry.mockResolvedValue({
+      downloadUrl: "https://signed/url",
+      matchedKey: "primary-key",
+    });
+    timerHoist.queue.push(1400, 300); // download, extract
+
+    await run();
+
+    const calls = vi.mocked(core.info).mock.calls.map((c) => c[0]);
+    expect(calls).toContain("Cache version: computed-ver");
+    expect(calls).toContain("Cache restored from key: primary-key");
+    expect(
+      calls.find((s) => s.startsWith("Downloaded 12.0 MB in 1.4s")),
+    ).toMatch(/Downloaded 12\.0 MB in 1\.4s \([\d.]+ MB\/s\)/);
+    expect(calls).toContain("Extracted in 300ms");
+    expect(calls).toContain("Cache restored successfully");
+  });
+
+  it("emits the miss line listing primary + restore-keys joined", async () => {
+    multilineInputs["restore-keys"] = ["restore-key-1", "restore-key-2"];
+    vi.mocked(mintAndExchange).mockResolvedValue({ token: "tok" });
+    cacheClientHoist.lookupEntry.mockResolvedValue(null);
+
+    await run();
+
+    const calls = vi.mocked(core.info).mock.calls.map((c) => c[0]);
+    expect(calls).toContain(
+      "Cache not found for input keys: primary-key, restore-key-1, restore-key-2",
+    );
+    expect(calls.find((s) => s.startsWith("Downloaded "))).toBeUndefined();
+  });
+
+  it("omits the speed parenthetical when download duration < 50 ms", async () => {
+    vi.mocked(mintAndExchange).mockResolvedValue({ token: "tok" });
+    cacheClientHoist.lookupEntry.mockResolvedValue({
+      downloadUrl: "https://signed/url",
+      matchedKey: "primary-key",
+    });
+    timerHoist.queue.push(8, 100); // download (sub-50ms), extract
+
+    await run();
+
+    const calls = vi.mocked(core.info).mock.calls.map((c) => c[0]);
+    const downloadedLine = calls.find((s) => s.startsWith("Downloaded "));
+    expect(downloadedLine).toBe("Downloaded 12.0 MB in 8ms");
   });
 });
