@@ -8,7 +8,7 @@ permissions:
   contents: write
   pull-requests: write
 
-# Shares the concurrency group with build-dist-on-main.yml so the two
+# Shares the concurrency group with build-dist.yml so the two
 # workflows serialize on every push to main. With cancel-in-progress: false,
 # GitHub queues the second workflow as pending and replaces any older pending
 # run with the newer trigger — guaranteeing release-please always rebases the

@@ -22,7 +22,7 @@ on:
       - 'package.json'
       - 'package-lock.json'
       - 'tsconfig.json'
-      - '.github/workflows/build-dist-on-main.yml'
+      - 'build-dist.yml'
 
 permissions:
   contents: write
