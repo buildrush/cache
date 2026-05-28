@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.2.0](https://github.com/buildrush/cache/compare/v1.1.2...v1.2.0) (2026-05-28)
+
+
+### Features
+
+* emit per-step verbose log lines on save and restore ([#12](https://github.com/buildrush/cache/issues/12)) ([b7662ac](https://github.com/buildrush/cache/commit/b7662ac37f2352a9a82df45f21e3b8ef16b8237c))
+
 ## [1.1.2](https://github.com/buildrush/cache/compare/v1.1.1...v1.1.2) (2026-05-28)
 
 

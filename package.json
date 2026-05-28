@@ -1,6 +1,6 @@
 {
   "name": "buildrush-cache-action",
-  "version": "1.1.2",
+  "version": "1.2.0",
   "description": "Drop-in replacement for actions/cache@v5 backed by Build_Rush.",
   "private": true,
   "engines": {
