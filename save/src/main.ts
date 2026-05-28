@@ -13,7 +13,7 @@ import {
 } from "../../src/client/cacheClient.js";
 import { computeCacheVersion } from "../../src/archive/version.js";
 import { compressStream } from "../../src/archive/compress.js";
-import { expandHomeTilde } from "../../src/archive/paths.js";
+import { expandGlobs, expandHomeTilde } from "../../src/archive/paths.js";
 import { createTarStream } from "../../src/archive/tar.js";
 import { chooseUploadMode, putSingleShot, putChunked } from "../../src/transport/upload.js";
 import { CountingPassThrough } from "../../src/archive/counting.js";
@@ -99,12 +99,31 @@ export async function run(): Promise<void> {
   try {
     const outHandle = await fs.open(archivePath, "w");
     try {
-      // Expand `~` so node-tar can find the source dirs. `paths` itself
-      // stays literal so computeCacheVersion's digest remains stable
-      // across runners (see src/archive/version.ts header comment).
+      // Expand `~` then glob patterns so node-tar can find the source dirs.
+      // `paths` itself stays literal so computeCacheVersion's digest remains
+      // stable across runners (see src/archive/version.ts header comment).
+      // Split include vs `!`-prefixed exclude entries so each list is globbed
+      // independently — glob-expanding the combined list would treat `!`
+      // entries as glob negations, but createTarStream needs them as literal
+      // exclusion roots for its filter callback.
+      const tildeExpanded = expandHomeTilde(paths);
+      const rawIncludes: string[] = [];
+      const rawExcludes: string[] = [];
+      for (const entry of tildeExpanded) {
+        if (entry.startsWith("!")) rawExcludes.push(entry.slice(1));
+        else rawIncludes.push(entry);
+      }
+      const [expandedIncludes, expandedExcludes] = await Promise.all([
+        expandGlobs(rawIncludes),
+        expandGlobs(rawExcludes),
+      ]);
+      const expandedPaths = [
+        ...expandedIncludes,
+        ...expandedExcludes.map((p) => `!${p}`),
+      ];
       counter = new CountingPassThrough();
       await pipeline(
-        createTarStream(expandHomeTilde(paths), process.cwd()),
+        createTarStream(expandedPaths, process.cwd()),
         counter,
         compressStream(),
         outHandle.createWriteStream(),

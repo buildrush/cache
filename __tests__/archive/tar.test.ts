@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as os from "node:os";
 import { Readable } from "node:stream";
+import { expandGlobs } from "../../src/archive/paths.js";
 import {
   createTarStream,
   extractTarStream,
@@ -108,6 +109,136 @@ describe("createTarStream / extractTarStream", () => {
     try {
       await extractTarStream(archive, unrelated);
       expect(await fs.readFile(path.join(absSrc, "stamp"), "utf8")).toBe("marker");
+    } finally {
+      await fs.rm(unrelated, { recursive: true, force: true });
+    }
+  });
+
+  it("excludes !-prefixed entries from the archive (NuGet-style exclusion)", async () => {
+    // Reproduces the actions/cache examples.md NuGet "with exclusions" snippet:
+    //   path: |
+    //     ~/.nuget/packages
+    //     !~/.nuget/packages/unwanted
+    // After expandHomeTilde the entries are absolute paths, with the `!`
+    // prefix preserved on the exclusion. Without filter handling, node-tar
+    // treats `!<absolute-path>` as a literal directory and ENOENTs on lstat.
+    const root = path.join(dir, "packages");
+    const wantedDir = path.join(root, "wanted");
+    const unwantedDir = path.join(root, "unwanted");
+    await fs.mkdir(wantedDir, { recursive: true });
+    await fs.mkdir(unwantedDir, { recursive: true });
+    await fs.writeFile(path.join(wantedDir, "kept.txt"), "kept");
+    await fs.writeFile(path.join(unwantedDir, "excluded.txt"), "excluded");
+
+    const archive = path.join(dir, "excl.tar");
+    await fs.writeFile(
+      archive,
+      await streamToBuffer(
+        createTarStream([root, `!${unwantedDir}`], dir),
+      ),
+    );
+
+    // Extract into an unrelated cwd; absolute paths reconstruct at their
+    // original location, just like the round-trip test above.
+    const unrelated = await fs.mkdtemp(path.join(os.tmpdir(), "br-tar-cwd-"));
+    try {
+      // Wipe the source first so we can assert what was packed vs what was not.
+      await fs.rm(root, { recursive: true, force: true });
+      await extractTarStream(archive, unrelated);
+
+      const keptPath = path.join(wantedDir, "kept.txt");
+      const excludedPath = path.join(unwantedDir, "excluded.txt");
+      expect(await fs.readFile(keptPath, "utf8")).toBe("kept");
+      await expect(fs.access(excludedPath)).rejects.toThrow();
+    } finally {
+      await fs.rm(unrelated, { recursive: true, force: true });
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("excludes !-prefixed entries when given a relative path", async () => {
+    // Same exclusion semantics, but with cwd-relative inputs (the form used
+    // by repository-relative cache paths). Asserts the exclusion is matched
+    // by tar's resolved absolute path, not by string prefix on the input.
+    const root = path.join(dir, "tree");
+    const keepDir = path.join(root, "keep");
+    const dropDir = path.join(root, "drop");
+    await fs.mkdir(keepDir, { recursive: true });
+    await fs.mkdir(dropDir, { recursive: true });
+    await fs.writeFile(path.join(keepDir, "k.txt"), "k");
+    await fs.writeFile(path.join(dropDir, "d.txt"), "d");
+
+    const archive = path.join(dir, "rel-excl.tar");
+    // Relative includes + `!`-prefixed relative exclusion, both resolved
+    // against `dir` (cwd).
+    await fs.writeFile(
+      archive,
+      await streamToBuffer(createTarStream(["tree", "!tree/drop"], dir)),
+    );
+
+    const dst = path.join(dir, "out");
+    await fs.mkdir(dst);
+    await extractTarStream(archive, dst);
+
+    expect(await fs.readFile(path.join(dst, "tree/keep/k.txt"), "utf8")).toBe(
+      "k",
+    );
+    await expect(fs.access(path.join(dst, "tree/drop/d.txt"))).rejects.toThrow();
+  });
+
+  it("throws when only !-prefixed exclusion entries are provided", () => {
+    // An exclusion-only list has no includes to pack. tar v7 throws or hangs
+    // on an empty include set, so we mirror the empty-list guard.
+    expect(() => createTarStream(["!/tmp/foo"], dir)).toThrow(
+      /must not be empty/,
+    );
+  });
+
+  it("expandGlobs + createTarStream round-trips `**/node_modules` (lerna recipe)", async () => {
+    // Integration: the full save-side glob pipeline. Seeds node_modules at
+    // two depths (mirroring the compat workflow's node-lerna job), runs
+    // expandGlobs on the literal `**/node_modules` pattern, then pipes the
+    // expanded paths through createTarStream. Extract and assert both
+    // stamps survive — the production failure mode is that the literal glob
+    // string is lstat()'d by tar and ENOENTs.
+    const real = await fs.realpath(dir);
+    await fs.mkdir(path.join(real, "node_modules"));
+    await fs.mkdir(path.join(real, "packages", "a", "node_modules"), {
+      recursive: true,
+    });
+    await fs.writeFile(path.join(real, "node_modules", "stamp"), "root");
+    await fs.writeFile(
+      path.join(real, "packages", "a", "node_modules", "stamp"),
+      "nested",
+    );
+
+    const expanded = await expandGlobs([
+      path.join(real, "**", "node_modules"),
+    ]);
+    expect(expanded.length).toBe(2);
+
+    const archive = path.join(real, "lerna.tar");
+    await fs.writeFile(
+      archive,
+      await streamToBuffer(createTarStream(expanded, real)),
+    );
+
+    // Wipe and restore to an unrelated cwd; absolute paths reconstruct at
+    // their original location.
+    await fs.rm(path.join(real, "node_modules"), { recursive: true });
+    await fs.rm(path.join(real, "packages"), { recursive: true });
+    const unrelated = await fs.mkdtemp(path.join(os.tmpdir(), "br-tar-cwd-"));
+    try {
+      await extractTarStream(archive, unrelated);
+      expect(
+        await fs.readFile(path.join(real, "node_modules", "stamp"), "utf8"),
+      ).toBe("root");
+      expect(
+        await fs.readFile(
+          path.join(real, "packages", "a", "node_modules", "stamp"),
+          "utf8",
+        ),
+      ).toBe("nested");
     } finally {
       await fs.rm(unrelated, { recursive: true, force: true });
     }

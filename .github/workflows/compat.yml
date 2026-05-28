@@ -1,0 +1,3059 @@
+name: compat
+
+# Run every actions/cache example as a save/restore round-trip against staging.
+# Each job's `with:` block is verbatim from actions/cache/examples.md, with two
+# allowed mods: (1) uses: actions/cache@v5 → uses: ./save and ./restore, (2)
+# KEY_NS prefix injected into key/restore-keys for cross-PR isolation.
+#
+# Synthetic seeding only — no real toolchain installs. The compat surface we
+# test is the action's input shape, not each ecosystem's tool finding the
+# cache. End-to-end coverage stays in self-test.yml.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'restore/src/**'
+      - 'save/src/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'action.yml'
+      - 'restore/action.yml'
+      - 'save/action.yml'
+      - '.github/workflows/compat.yml'
+  push:
+    branches: [main]
+
+concurrency:
+  group: compat-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  build-dist:
+    name: Build dist for testing
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with: { node-version: 24, cache: npm }
+      - run: npm ci
+      - run: npm run build
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-bundle
+          path: dist
+
+  java-maven:
+    name: 'compat: Java Maven'
+    needs: build-dist
+    runs-on: ubuntu-latest
+    permissions: { id-token: write, contents: read }
+    env:
+      BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}
+      KEY_NS: compat-${{ github.run_id }}-${{ github.run_attempt }}-
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - name: Seed pom.xml (hash A)
+        run: echo '<project><version>A</version></project>' > pom.xml
+      - name: Seed cache payload
+        run: |
+          mkdir -p "$HOME/.m2/repository"
+          echo "marker-$GITHUB_RUN_ID-A" > "$HOME/.m2/repository/stamp"
+      - name: Save (lockfile = hash A)
+        uses: ./save
+        with:
+          audience: https://cache.buildrush.dev
+          path: |
+            ~/.m2/repository
+          key: ${{ env.KEY_NS }}${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+      - name: Wipe cache directories
+        run: rm -rf "$HOME/.m2/repository"
+      - id: restore-positive
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: |
+            ~/.m2/repository
+          key: ${{ env.KEY_NS }}${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-maven-
+      - name: Assert exact hit + record primary
+        env:
+          HIT: ${{ steps.restore-positive.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-positive.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "true" || { echo "expected hit, got $HIT"; exit 1; }
+          test -n "$MATCHED" || { echo "matched-key empty"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" "$HOME/.m2/repository/stamp" \
+            || { echo "bytes mismatch on positive restore"; exit 1; }
+          echo "PRIOR_PRIMARY=$MATCHED" >> "$GITHUB_ENV"
+      - name: Bump pom.xml to hash B
+        run: echo '<project><version>B</version></project>' > pom.xml
+      - name: Wipe cache directories again
+        run: rm -rf "$HOME/.m2/repository"
+      - id: restore-fallback
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: |
+            ~/.m2/repository
+          key: ${{ env.KEY_NS }}${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-maven-
+      - name: Assert prefix-fallback (miss + matched == prior primary)
+        env:
+          HIT: ${{ steps.restore-fallback.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-fallback.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "false" || { echo "expected miss on bumped key, got $HIT"; exit 1; }
+          test "$MATCHED" = "$PRIOR_PRIMARY" \
+            || { echo "expected matched=$PRIOR_PRIMARY, got $MATCHED"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" "$HOME/.m2/repository/stamp" \
+            || { echo "fallback restored wrong bytes"; exit 1; }
+
+  bun-linux:
+    name: 'compat: Bun (Linux)'
+    needs: build-dist
+    runs-on: ubuntu-latest
+    permissions: { id-token: write, contents: read }
+    env:
+      BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}
+      KEY_NS: compat-${{ github.run_id }}-${{ github.run_attempt }}-
+    defaults: { run: { shell: bash } }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - name: Seed bun.lock
+        run: echo '{"lockfileVersion":1,"workspaces":{},"packages":{}}' > bun.lock
+      - name: Seed cache payload
+        run: |
+          mkdir -p "$HOME/.bun/install/cache"
+          echo "marker-$GITHUB_RUN_ID" > "$HOME/.bun/install/cache/stamp"
+      - name: Save
+        uses: ./save
+        with:
+          audience: https://cache.buildrush.dev
+          path: |
+            ~/.bun/install/cache
+          key: ${{ env.KEY_NS }}${{ runner.os }}-bun-${{ hashFiles('**/bun.lock') }}
+      - name: Wipe
+        run: rm -rf "$HOME/.bun/install/cache"
+      - id: restore
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: |
+            ~/.bun/install/cache
+          key: ${{ env.KEY_NS }}${{ runner.os }}-bun-${{ hashFiles('**/bun.lock') }}
+      - name: Assert exact hit + bytes
+        env:
+          HIT: ${{ steps.restore.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "true" || { echo "expected hit, got $HIT"; exit 1; }
+          test -n "$MATCHED" || { echo "matched-key empty"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID" "$HOME/.bun/install/cache/stamp" \
+            || { echo "bytes mismatch"; exit 1; }
+
+  bun-windows:
+    name: 'compat: Bun (Windows)'
+    needs: build-dist
+    runs-on: windows-latest
+    permissions: { id-token: write, contents: read }
+    env:
+      BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}
+      KEY_NS: compat-${{ github.run_id }}-${{ github.run_attempt }}-
+    defaults: { run: { shell: bash } }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - name: Seed bun.lock
+        run: echo '{"lockfileVersion":1,"workspaces":{},"packages":{}}' > bun.lock
+      - name: Seed cache payload
+        run: |
+          mkdir -p "$HOME/.bun"
+          echo "marker-$GITHUB_RUN_ID" > "$HOME/.bun/stamp"
+      - name: Save
+        uses: ./save
+        with:
+          audience: https://cache.buildrush.dev
+          path: |
+            ~\.bun
+          key: ${{ env.KEY_NS }}${{ runner.os }}-bun-${{ hashFiles('**/bun.lock') }}
+      - name: Wipe
+        run: rm -rf "$HOME/.bun"
+      - id: restore
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: |
+            ~\.bun
+          key: ${{ env.KEY_NS }}${{ runner.os }}-bun-${{ hashFiles('**/bun.lock') }}
+      - name: Assert exact hit + bytes
+        env:
+          HIT: ${{ steps.restore.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "true" || { echo "expected hit, got $HIT"; exit 1; }
+          test -n "$MATCHED" || { echo "matched-key empty"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID" "$HOME/.bun/stamp" \
+            || { echo "bytes mismatch"; exit 1; }
+
+  deno-linux:
+    name: 'compat: Deno (Linux)'
+    needs: build-dist
+    runs-on: ubuntu-latest
+    permissions: { id-token: write, contents: read }
+    env:
+      BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}
+      KEY_NS: compat-${{ github.run_id }}-${{ github.run_attempt }}-
+    defaults: { run: { shell: bash } }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - name: Seed deps.ts
+        run: echo 'export const VERSION = "A";' > deps.ts
+      - name: Seed cache payloads
+        run: |
+          mkdir -p "$HOME/.deno" "$HOME/.cache/deno"
+          echo "marker-deno-$GITHUB_RUN_ID" > "$HOME/.deno/stamp"
+          echo "marker-cache-$GITHUB_RUN_ID" > "$HOME/.cache/deno/stamp"
+      - name: Save
+        uses: ./save
+        with:
+          audience: https://cache.buildrush.dev
+          path: |
+            ~/.deno
+            ~/.cache/deno
+          key: ${{ env.KEY_NS }}${{ runner.os }}-deno-${{ hashFiles('**/deps.ts') }}
+      - name: Wipe
+        run: rm -rf "$HOME/.deno" "$HOME/.cache/deno"
+      - id: restore
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: |
+            ~/.deno
+            ~/.cache/deno
+          key: ${{ env.KEY_NS }}${{ runner.os }}-deno-${{ hashFiles('**/deps.ts') }}
+      - name: Assert exact hit + bytes
+        env:
+          HIT: ${{ steps.restore.outputs.cache-hit }}
+        run: |
+          test "$HIT" = "true" || { echo "expected hit, got $HIT"; exit 1; }
+          grep -q "marker-deno-$GITHUB_RUN_ID" "$HOME/.deno/stamp" \
+            || { echo "~/.deno bytes mismatch"; exit 1; }
+          grep -q "marker-cache-$GITHUB_RUN_ID" "$HOME/.cache/deno/stamp" \
+            || { echo "~/.cache/deno bytes mismatch"; exit 1; }
+
+  deno-macos:
+    name: 'compat: Deno (macOS)'
+    needs: build-dist
+    runs-on: macos-latest
+    permissions: { id-token: write, contents: read }
+    env:
+      BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}
+      KEY_NS: compat-${{ github.run_id }}-${{ github.run_attempt }}-
+    defaults: { run: { shell: bash } }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - name: Seed deps.ts
+        run: echo 'export const VERSION = "A";' > deps.ts
+      - name: Seed cache payloads
+        run: |
+          mkdir -p "$HOME/.deno" "$HOME/Library/Caches/deno"
+          echo "marker-deno-$GITHUB_RUN_ID" > "$HOME/.deno/stamp"
+          echo "marker-cache-$GITHUB_RUN_ID" > "$HOME/Library/Caches/deno/stamp"
+      - name: Save
+        uses: ./save
+        with:
+          audience: https://cache.buildrush.dev
+          path: |
+            ~/.deno
+            ~/Library/Caches/deno
+          key: ${{ env.KEY_NS }}${{ runner.os }}-deno-${{ hashFiles('**/deps.ts') }}
+      - name: Wipe
+        run: rm -rf "$HOME/.deno" "$HOME/Library/Caches/deno"
+      - id: restore
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: |
+            ~/.deno
+            ~/Library/Caches/deno
+          key: ${{ env.KEY_NS }}${{ runner.os }}-deno-${{ hashFiles('**/deps.ts') }}
+      - name: Assert exact hit + bytes
+        env:
+          HIT: ${{ steps.restore.outputs.cache-hit }}
+        run: |
+          test "$HIT" = "true" || { echo "expected hit, got $HIT"; exit 1; }
+          grep -q "marker-deno-$GITHUB_RUN_ID" "$HOME/.deno/stamp" \
+            || { echo "~/.deno bytes mismatch"; exit 1; }
+          grep -q "marker-cache-$GITHUB_RUN_ID" "$HOME/Library/Caches/deno/stamp" \
+            || { echo "macOS path bytes mismatch"; exit 1; }
+
+  deno-windows:
+    name: 'compat: Deno (Windows)'
+    needs: build-dist
+    runs-on: windows-latest
+    permissions: { id-token: write, contents: read }
+    env:
+      BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}
+      KEY_NS: compat-${{ github.run_id }}-${{ github.run_attempt }}-
+    defaults: { run: { shell: bash } }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - name: Seed deps.ts
+        run: echo 'export const VERSION = "A";' > deps.ts
+      - name: Seed cache payloads
+        run: |
+          mkdir -p "$HOME/.deno" "$HOME/AppData/Local/deno"
+          echo "marker-deno-$GITHUB_RUN_ID" > "$HOME/.deno/stamp"
+          echo "marker-appdata-$GITHUB_RUN_ID" > "$HOME/AppData/Local/deno/stamp"
+      - name: Save
+        uses: ./save
+        with:
+          audience: https://cache.buildrush.dev
+          path: |
+            ~\.deno
+            ~\AppData\Local\deno
+          key: ${{ env.KEY_NS }}${{ runner.os }}-deno-${{ hashFiles('**/deps.ts') }}
+      - name: Wipe
+        run: rm -rf "$HOME/.deno" "$HOME/AppData/Local/deno"
+      - id: restore
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: |
+            ~\.deno
+            ~\AppData\Local\deno
+          key: ${{ env.KEY_NS }}${{ runner.os }}-deno-${{ hashFiles('**/deps.ts') }}
+      - name: Assert exact hit + bytes
+        env:
+          HIT: ${{ steps.restore.outputs.cache-hit }}
+        run: |
+          test "$HIT" = "true" || { echo "expected hit, got $HIT"; exit 1; }
+          grep -q "marker-deno-$GITHUB_RUN_ID" "$HOME/.deno/stamp" \
+            || { echo "~/.deno bytes mismatch"; exit 1; }
+          grep -q "marker-appdata-$GITHUB_RUN_ID" "$HOME/AppData/Local/deno/stamp" \
+            || { echo "AppData bytes mismatch"; exit 1; }
+
+  nuget-basic:
+    name: 'compat: NuGet (basic)'
+    needs: build-dist
+    runs-on: ubuntu-latest
+    permissions: { id-token: write, contents: read }
+    env:
+      BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}
+      KEY_NS: compat-${{ github.run_id }}-${{ github.run_attempt }}-
+    defaults: { run: { shell: bash } }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - name: Seed packages.lock.json (hash A)
+        run: echo '{"version":1,"hash":"A"}' > packages.lock.json
+      - name: Seed cache payload
+        run: |
+          mkdir -p "$HOME/.nuget/packages"
+          echo "marker-$GITHUB_RUN_ID-A" > "$HOME/.nuget/packages/stamp"
+      - name: Save
+        uses: ./save
+        with:
+          audience: https://cache.buildrush.dev
+          path: ~/.nuget/packages
+          key: ${{ env.KEY_NS }}${{ runner.os }}-nuget-${{ hashFiles('**/packages.lock.json') }}
+      - name: Wipe
+        run: rm -rf "$HOME/.nuget/packages"
+      - id: restore-positive
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: ~/.nuget/packages
+          key: ${{ env.KEY_NS }}${{ runner.os }}-nuget-${{ hashFiles('**/packages.lock.json') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-nuget-
+      - name: Assert hit + record primary
+        env:
+          HIT: ${{ steps.restore-positive.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-positive.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "true" || { echo "expected hit"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" "$HOME/.nuget/packages/stamp" || { echo "bytes mismatch"; exit 1; }
+          echo "PRIOR_PRIMARY=$MATCHED" >> "$GITHUB_ENV"
+      - name: Bump packages.lock.json to B
+        run: echo '{"version":1,"hash":"B"}' > packages.lock.json
+      - run: rm -rf "$HOME/.nuget/packages"
+      - id: restore-fallback
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: ~/.nuget/packages
+          key: ${{ env.KEY_NS }}${{ runner.os }}-nuget-${{ hashFiles('**/packages.lock.json') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-nuget-
+      - name: Assert fallback
+        env:
+          HIT: ${{ steps.restore-fallback.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-fallback.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "false" || { echo "expected miss"; exit 1; }
+          test "$MATCHED" = "$PRIOR_PRIMARY" || { echo "matched != prior primary"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" "$HOME/.nuget/packages/stamp" || { echo "bytes mismatch"; exit 1; }
+
+  nuget-exclusions:
+    name: 'compat: NuGet (with exclusions)'
+    needs: build-dist
+    runs-on: ubuntu-latest
+    permissions: { id-token: write, contents: read }
+    env:
+      BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}
+      KEY_NS: compat-${{ github.run_id }}-${{ github.run_attempt }}-
+    defaults: { run: { shell: bash } }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - name: Seed packages.lock.json (hash A)
+        run: echo '{"version":1,"hash":"A"}' > packages.lock.json
+      - name: Seed BOTH wanted and unwanted under cache dir
+        run: |
+          mkdir -p "$HOME/.nuget/packages/wanted" "$HOME/.nuget/packages/unwanted"
+          echo "kept-$GITHUB_RUN_ID" > "$HOME/.nuget/packages/wanted/file"
+          echo "excluded-$GITHUB_RUN_ID" > "$HOME/.nuget/packages/unwanted/file"
+      - name: Save (with ! exclusion)
+        uses: ./save
+        with:
+          audience: https://cache.buildrush.dev
+          path: |
+            ~/.nuget/packages
+            !~/.nuget/packages/unwanted
+          key: ${{ env.KEY_NS }}${{ runner.os }}-nuget-${{ hashFiles('**/packages.lock.json') }}
+      - name: Wipe
+        run: rm -rf "$HOME/.nuget/packages"
+      - id: restore-positive
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: |
+            ~/.nuget/packages
+            !~/.nuget/packages/unwanted
+          key: ${{ env.KEY_NS }}${{ runner.os }}-nuget-${{ hashFiles('**/packages.lock.json') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-nuget-
+      - name: Assert hit + wanted present + unwanted absent
+        env:
+          HIT: ${{ steps.restore-positive.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-positive.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "true" || { echo "expected hit, got $HIT"; exit 1; }
+          test -f "$HOME/.nuget/packages/wanted/file" || { echo "wanted/file missing after restore"; exit 1; }
+          grep -q "kept-$GITHUB_RUN_ID" "$HOME/.nuget/packages/wanted/file" || { echo "wanted/file bytes mismatch"; exit 1; }
+          test ! -e "$HOME/.nuget/packages/unwanted/file" || { echo "unwanted/file should not be restored (exclusion failed)"; exit 1; }
+          echo "PRIOR_PRIMARY=$MATCHED" >> "$GITHUB_ENV"
+      - name: Bump packages.lock.json to B
+        run: echo '{"version":1,"hash":"B"}' > packages.lock.json
+      - run: rm -rf "$HOME/.nuget/packages"
+      - id: restore-fallback
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: |
+            ~/.nuget/packages
+            !~/.nuget/packages/unwanted
+          key: ${{ env.KEY_NS }}${{ runner.os }}-nuget-${{ hashFiles('**/packages.lock.json') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-nuget-
+      - name: Assert fallback + exclusion preserved
+        env:
+          HIT: ${{ steps.restore-fallback.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-fallback.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "false" || { echo "expected miss"; exit 1; }
+          test "$MATCHED" = "$PRIOR_PRIMARY" || { echo "matched != prior primary"; exit 1; }
+          test -f "$HOME/.nuget/packages/wanted/file" || { echo "wanted/file missing on fallback restore"; exit 1; }
+          test ! -e "$HOME/.nuget/packages/unwanted/file" || { echo "unwanted/file should not be present on fallback restore"; exit 1; }
+
+  nuget-custom-location:
+    name: 'compat: NuGet (custom location)'
+    needs: build-dist
+    runs-on: ubuntu-latest
+    permissions: { id-token: write, contents: read }
+    env:
+      BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}
+      KEY_NS: compat-${{ github.run_id }}-${{ github.run_attempt }}-
+      NUGET_PACKAGES: ${{ github.workspace }}/.nuget/packages
+    defaults: { run: { shell: bash } }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - name: Seed packages.lock.json (hash A)
+        run: echo '{"version":1,"hash":"A"}' > packages.lock.json
+      - name: Seed cache payload
+        run: |
+          mkdir -p "${{ github.workspace }}/.nuget/packages"
+          echo "marker-$GITHUB_RUN_ID-A" > "${{ github.workspace }}/.nuget/packages/stamp"
+      - name: Save
+        uses: ./save
+        with:
+          audience: https://cache.buildrush.dev
+          path: ${{ github.workspace }}/.nuget/packages
+          key: ${{ env.KEY_NS }}${{ runner.os }}-nuget-${{ hashFiles('**/packages.lock.json') }}
+      - name: Wipe
+        run: rm -rf "${{ github.workspace }}/.nuget/packages"
+      - id: restore-positive
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: ${{ github.workspace }}/.nuget/packages
+          key: ${{ env.KEY_NS }}${{ runner.os }}-nuget-${{ hashFiles('**/packages.lock.json') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-nuget-
+      - name: Assert hit + bytes + record primary
+        env:
+          HIT: ${{ steps.restore-positive.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-positive.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "true" || { echo "expected hit"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" "${{ github.workspace }}/.nuget/packages/stamp" || { echo "bytes mismatch"; exit 1; }
+          echo "PRIOR_PRIMARY=$MATCHED" >> "$GITHUB_ENV"
+      - name: Bump packages.lock.json to B
+        run: echo '{"version":1,"hash":"B"}' > packages.lock.json
+      - run: rm -rf "${{ github.workspace }}/.nuget/packages"
+      - id: restore-fallback
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: ${{ github.workspace }}/.nuget/packages
+          key: ${{ env.KEY_NS }}${{ runner.os }}-nuget-${{ hashFiles('**/packages.lock.json') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-nuget-
+      - name: Assert fallback
+        env:
+          HIT: ${{ steps.restore-fallback.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-fallback.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "false" || { echo "expected miss"; exit 1; }
+          test "$MATCHED" = "$PRIOR_PRIMARY" || { echo "matched != prior primary"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" "${{ github.workspace }}/.nuget/packages/stamp" || { echo "bytes mismatch"; exit 1; }
+
+  clojure-lein:
+    name: 'compat: Clojure Lein'
+    needs: build-dist
+    runs-on: ubuntu-latest
+    permissions: { id-token: write, contents: read }
+    env:
+      BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}
+      KEY_NS: compat-${{ github.run_id }}-${{ github.run_attempt }}-
+    defaults: { run: { shell: bash } }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - name: Seed project.clj (hash A)
+        run: echo '(defproject test "A")' > project.clj
+      - name: Seed cache payload
+        run: |
+          mkdir -p "$HOME/.m2/repository"
+          echo "marker-$GITHUB_RUN_ID-A" > "$HOME/.m2/repository/stamp"
+      - name: Save
+        uses: ./save
+        with:
+          audience: https://cache.buildrush.dev
+          path: ~/.m2/repository
+          key: ${{ env.KEY_NS }}${{ runner.os }}-clojure-${{ hashFiles('**/project.clj') }}
+      - name: Wipe
+        run: rm -rf "$HOME/.m2/repository"
+      - id: restore-positive
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: ~/.m2/repository
+          key: ${{ env.KEY_NS }}${{ runner.os }}-clojure-${{ hashFiles('**/project.clj') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-clojure
+      - name: Assert hit + record primary
+        env:
+          HIT: ${{ steps.restore-positive.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-positive.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "true" || { echo "expected hit, got $HIT"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" "$HOME/.m2/repository/stamp" || { echo "bytes mismatch"; exit 1; }
+          echo "PRIOR_PRIMARY=$MATCHED" >> "$GITHUB_ENV"
+      - name: Bump project.clj to B
+        run: echo '(defproject test "B")' > project.clj
+      - run: rm -rf "$HOME/.m2/repository"
+      - id: restore-fallback
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: ~/.m2/repository
+          key: ${{ env.KEY_NS }}${{ runner.os }}-clojure-${{ hashFiles('**/project.clj') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-clojure
+      - name: Assert fallback
+        env:
+          HIT: ${{ steps.restore-fallback.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-fallback.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "false" || { echo "expected miss"; exit 1; }
+          test "$MATCHED" = "$PRIOR_PRIMARY" || { echo "matched != prior primary"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" "$HOME/.m2/repository/stamp" || { echo "bytes mismatch"; exit 1; }
+
+  elixir-mix:
+    name: 'compat: Elixir Mix'
+    needs: build-dist
+    runs-on: ubuntu-latest
+    permissions: { id-token: write, contents: read }
+    env:
+      BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}
+      KEY_NS: compat-${{ github.run_id }}-${{ github.run_attempt }}-
+    defaults: { run: { shell: bash } }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - name: Seed mix.lock (hash A)
+        run: echo '%{"A" => "1"}' > mix.lock
+      - name: Seed cache payloads
+        run: |
+          mkdir -p deps _build
+          echo "marker-$GITHUB_RUN_ID-A" > deps/stamp
+          echo "marker-$GITHUB_RUN_ID-A" > _build/stamp
+      - name: Save
+        uses: ./save
+        with:
+          audience: https://cache.buildrush.dev
+          path: |
+            deps
+            _build
+          key: ${{ env.KEY_NS }}${{ runner.os }}-mix-${{ hashFiles('**/mix.lock') }}
+      - name: Wipe
+        run: rm -rf deps _build
+      - id: restore-positive
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: |
+            deps
+            _build
+          key: ${{ env.KEY_NS }}${{ runner.os }}-mix-${{ hashFiles('**/mix.lock') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-mix-
+      - name: Assert hit + record primary
+        env:
+          HIT: ${{ steps.restore-positive.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-positive.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "true" || { echo "expected hit"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" deps/stamp || { echo "deps bytes mismatch"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" _build/stamp || { echo "_build bytes mismatch"; exit 1; }
+          echo "PRIOR_PRIMARY=$MATCHED" >> "$GITHUB_ENV"
+      - name: Bump mix.lock to B
+        run: echo '%{"B" => "1"}' > mix.lock
+      - run: rm -rf deps _build
+      - id: restore-fallback
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: |
+            deps
+            _build
+          key: ${{ env.KEY_NS }}${{ runner.os }}-mix-${{ hashFiles('**/mix.lock') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-mix-
+      - name: Assert fallback
+        env:
+          HIT: ${{ steps.restore-fallback.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-fallback.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "false" || { echo "expected miss"; exit 1; }
+          test "$MATCHED" = "$PRIOR_PRIMARY" || { echo "matched != prior primary"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" deps/stamp || { echo "fallback deps bytes mismatch"; exit 1; }
+
+  erlang-rebar3:
+    name: 'compat: Erlang Rebar3'
+    needs: build-dist
+    runs-on: ubuntu-latest
+    permissions: { id-token: write, contents: read }
+    env:
+      BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}
+      KEY_NS: compat-${{ github.run_id }}-${{ github.run_attempt }}-
+      OTP_VERSION: '27'
+    defaults: { run: { shell: bash } }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - name: Seed rebar.lock (hash A)
+        run: echo '{"A":"1"}' > rebar.lock
+      - name: Seed cache payloads
+        run: |
+          mkdir -p "$HOME/.cache/rebar3" _build
+          echo "marker-$GITHUB_RUN_ID-A" > "$HOME/.cache/rebar3/stamp"
+          echo "marker-$GITHUB_RUN_ID-A" > _build/stamp
+      - name: Save
+        uses: ./save
+        with:
+          audience: https://cache.buildrush.dev
+          path: |
+            ~/.cache/rebar3
+            _build
+          key: ${{ env.KEY_NS }}${{ runner.os }}-erlang-${{ env.OTP_VERSION }}-${{ hashFiles('**/*rebar.lock') }}
+      - name: Wipe
+        run: rm -rf "$HOME/.cache/rebar3" _build
+      - id: restore-positive
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: |
+            ~/.cache/rebar3
+            _build
+          key: ${{ env.KEY_NS }}${{ runner.os }}-erlang-${{ env.OTP_VERSION }}-${{ hashFiles('**/*rebar.lock') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-erlang-${{ env.OTP_VERSION }}-
+      - name: Assert hit + record primary
+        env:
+          HIT: ${{ steps.restore-positive.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-positive.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "true" || { echo "expected hit"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" "$HOME/.cache/rebar3/stamp" || { echo "rebar3 bytes mismatch"; exit 1; }
+          echo "PRIOR_PRIMARY=$MATCHED" >> "$GITHUB_ENV"
+      - name: Bump rebar.lock to B
+        run: echo '{"B":"1"}' > rebar.lock
+      - run: rm -rf "$HOME/.cache/rebar3" _build
+      - id: restore-fallback
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: |
+            ~/.cache/rebar3
+            _build
+          key: ${{ env.KEY_NS }}${{ runner.os }}-erlang-${{ env.OTP_VERSION }}-${{ hashFiles('**/*rebar.lock') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-erlang-${{ env.OTP_VERSION }}-
+      - name: Assert fallback
+        env:
+          HIT: ${{ steps.restore-fallback.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-fallback.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "false" || { echo "expected miss"; exit 1; }
+          test "$MATCHED" = "$PRIOR_PRIMARY" || { echo "matched != prior primary"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" "$HOME/.cache/rebar3/stamp" || { echo "bytes mismatch"; exit 1; }
+
+  php-composer:
+    name: 'compat: PHP Composer'
+    needs: build-dist
+    runs-on: ubuntu-latest
+    permissions: { id-token: write, contents: read }
+    env:
+      BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}
+      KEY_NS: compat-${{ github.run_id }}-${{ github.run_attempt }}-
+    defaults: { run: { shell: bash } }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - id: composer-cache
+        name: Stub composer cache directory
+        run: |
+          mkdir -p "$HOME/.composer-cache"
+          echo "dir=$HOME/.composer-cache" >> $GITHUB_OUTPUT
+      - name: Seed composer.lock (hash A)
+        run: echo '{"hash":"A"}' > composer.lock
+      - name: Seed cache payload
+        run: echo "marker-$GITHUB_RUN_ID-A" > "$HOME/.composer-cache/stamp"
+      - name: Save
+        uses: ./save
+        with:
+          audience: https://cache.buildrush.dev
+          path: ${{ steps.composer-cache.outputs.dir }}
+          key: ${{ env.KEY_NS }}${{ runner.os }}-composer-${{ hashFiles('**/composer.lock') }}
+      - name: Wipe
+        run: rm -rf "$HOME/.composer-cache"
+      - id: restore-positive
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: ${{ steps.composer-cache.outputs.dir }}
+          key: ${{ env.KEY_NS }}${{ runner.os }}-composer-${{ hashFiles('**/composer.lock') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-composer-
+      - name: Assert hit + record primary
+        env:
+          HIT: ${{ steps.restore-positive.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-positive.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "true" || { echo "expected hit"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" "$HOME/.composer-cache/stamp" || { echo "bytes mismatch"; exit 1; }
+          echo "PRIOR_PRIMARY=$MATCHED" >> "$GITHUB_ENV"
+      - name: Bump composer.lock to B
+        run: echo '{"hash":"B"}' > composer.lock
+      - run: rm -rf "$HOME/.composer-cache"
+      - id: restore-fallback
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: ${{ steps.composer-cache.outputs.dir }}
+          key: ${{ env.KEY_NS }}${{ runner.os }}-composer-${{ hashFiles('**/composer.lock') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-composer-
+      - name: Assert fallback
+        env:
+          HIT: ${{ steps.restore-fallback.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-fallback.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "false" || { echo "expected miss"; exit 1; }
+          test "$MATCHED" = "$PRIOR_PRIMARY" || { echo "matched != prior primary"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" "$HOME/.composer-cache/stamp" || { echo "bytes mismatch"; exit 1; }
+
+  java-gradle:
+    name: 'compat: Java Gradle'
+    needs: build-dist
+    runs-on: ubuntu-latest
+    permissions: { id-token: write, contents: read }
+    env:
+      BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}
+      KEY_NS: compat-${{ github.run_id }}-${{ github.run_attempt }}-
+    defaults: { run: { shell: bash } }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - name: Seed build.gradle (hash A)
+        run: echo '// version A' > build.gradle
+      - name: Seed cache payloads
+        run: |
+          mkdir -p "$HOME/.gradle/caches" "$HOME/.gradle/wrapper"
+          echo "marker-$GITHUB_RUN_ID-A" > "$HOME/.gradle/caches/stamp"
+          echo "marker-$GITHUB_RUN_ID-A" > "$HOME/.gradle/wrapper/stamp"
+      - name: Save
+        uses: ./save
+        with:
+          audience: https://cache.buildrush.dev
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ env.KEY_NS }}${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+      - name: Wipe
+        run: rm -rf "$HOME/.gradle/caches" "$HOME/.gradle/wrapper"
+      - id: restore-positive
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ env.KEY_NS }}${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-gradle-
+      - name: Assert hit + record primary
+        env:
+          HIT: ${{ steps.restore-positive.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-positive.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "true" || { echo "expected hit"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" "$HOME/.gradle/caches/stamp" || { echo "caches bytes mismatch"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" "$HOME/.gradle/wrapper/stamp" || { echo "wrapper bytes mismatch"; exit 1; }
+          echo "PRIOR_PRIMARY=$MATCHED" >> "$GITHUB_ENV"
+      - name: Bump build.gradle to B
+        run: echo '// version B' > build.gradle
+      - run: rm -rf "$HOME/.gradle/caches" "$HOME/.gradle/wrapper"
+      - id: restore-fallback
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ env.KEY_NS }}${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-gradle-
+      - name: Assert fallback
+        env:
+          HIT: ${{ steps.restore-fallback.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-fallback.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "false" || { echo "expected miss"; exit 1; }
+          test "$MATCHED" = "$PRIOR_PRIMARY" || { echo "matched != prior primary"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" "$HOME/.gradle/caches/stamp" || { echo "bytes mismatch"; exit 1; }
+
+  node-npm:
+    name: 'compat: Node npm'
+    needs: build-dist
+    runs-on: ubuntu-latest
+    permissions: { id-token: write, contents: read }
+    env:
+      BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}
+      KEY_NS: compat-${{ github.run_id }}-${{ github.run_attempt }}-
+    defaults: { run: { shell: bash } }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - id: npm-cache-dir
+        name: Stub npm cache directory
+        run: |
+          mkdir -p "$HOME/.npm-cache"
+          echo "dir=$HOME/.npm-cache" >> $GITHUB_OUTPUT
+      - name: Seed package-lock.json (hash A)
+        run: echo '{"name":"x","lockfileVersion":3,"hash":"A"}' > package-lock.json
+      - name: Seed cache payload
+        run: echo "marker-$GITHUB_RUN_ID-A" > "$HOME/.npm-cache/stamp"
+      - name: Save
+        uses: ./save
+        with:
+          audience: https://cache.buildrush.dev
+          path: ${{ steps.npm-cache-dir.outputs.dir }}
+          key: ${{ env.KEY_NS }}${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+      - name: Wipe
+        run: rm -rf "$HOME/.npm-cache"
+      - id: npm-cache
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: ${{ steps.npm-cache-dir.outputs.dir }}
+          key: ${{ env.KEY_NS }}${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-node-
+      - name: Assert hit + record primary
+        env:
+          HIT: ${{ steps.npm-cache.outputs.cache-hit }}
+          MATCHED: ${{ steps.npm-cache.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "true" || { echo "expected hit, got $HIT"; exit 1; }
+          test -n "$MATCHED" || { echo "matched empty"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" "$HOME/.npm-cache/stamp" || { echo "bytes mismatch"; exit 1; }
+          echo "PRIOR_PRIMARY=$MATCHED" >> "$GITHUB_ENV"
+      - name: Bump package-lock.json to B
+        run: echo '{"name":"x","lockfileVersion":3,"hash":"B"}' > package-lock.json
+      - run: rm -rf "$HOME/.npm-cache"
+      - id: npm-cache-2
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: ${{ steps.npm-cache-dir.outputs.dir }}
+          key: ${{ env.KEY_NS }}${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-node-
+      - name: Assert fallback
+        env:
+          HIT: ${{ steps.npm-cache-2.outputs.cache-hit }}
+          MATCHED: ${{ steps.npm-cache-2.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "false" || { echo "expected miss"; exit 1; }
+          test "$MATCHED" = "$PRIOR_PRIMARY" || { echo "matched != prior primary"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" "$HOME/.npm-cache/stamp" || { echo "bytes mismatch"; exit 1; }
+
+  node-yarn:
+    name: 'compat: Node Yarn'
+    needs: build-dist
+    runs-on: ubuntu-latest
+    permissions: { id-token: write, contents: read }
+    env:
+      BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}
+      KEY_NS: compat-${{ github.run_id }}-${{ github.run_attempt }}-
+    defaults: { run: { shell: bash } }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - id: yarn-cache-dir-path
+        name: Stub yarn cache directory
+        run: |
+          mkdir -p "$HOME/.yarn-cache"
+          echo "dir=$HOME/.yarn-cache" >> $GITHUB_OUTPUT
+      - name: Seed yarn.lock (hash A)
+        run: |
+          echo '__metadata: A' > yarn.lock
+      - name: Seed cache payload
+        run: echo "marker-$GITHUB_RUN_ID-A" > "$HOME/.yarn-cache/stamp"
+      - name: Save
+        uses: ./save
+        with:
+          audience: https://cache.buildrush.dev
+          path: ${{ steps.yarn-cache-dir-path.outputs.dir }}
+          key: ${{ env.KEY_NS }}${{ runner.os }}-yarn-${{ hashFiles('**/yarn.lock') }}
+      - name: Wipe
+        run: rm -rf "$HOME/.yarn-cache"
+      - id: yarn-cache
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: ${{ steps.yarn-cache-dir-path.outputs.dir }}
+          key: ${{ env.KEY_NS }}${{ runner.os }}-yarn-${{ hashFiles('**/yarn.lock') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-yarn-
+      - name: Assert hit + record primary
+        env:
+          HIT: ${{ steps.yarn-cache.outputs.cache-hit }}
+          MATCHED: ${{ steps.yarn-cache.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "true" || { echo "expected hit"; exit 1; }
+          test -n "$MATCHED" || { echo "matched empty"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" "$HOME/.yarn-cache/stamp" || { echo "bytes mismatch"; exit 1; }
+          echo "PRIOR_PRIMARY=$MATCHED" >> "$GITHUB_ENV"
+      - name: Bump yarn.lock to B
+        run: |
+          echo '__metadata: B' > yarn.lock
+      - run: rm -rf "$HOME/.yarn-cache"
+      - id: yarn-cache-2
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: ${{ steps.yarn-cache-dir-path.outputs.dir }}
+          key: ${{ env.KEY_NS }}${{ runner.os }}-yarn-${{ hashFiles('**/yarn.lock') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-yarn-
+      - name: Assert fallback
+        env:
+          HIT: ${{ steps.yarn-cache-2.outputs.cache-hit }}
+          MATCHED: ${{ steps.yarn-cache-2.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "false" || { echo "expected miss"; exit 1; }
+          test "$MATCHED" = "$PRIOR_PRIMARY" || { echo "matched != prior primary"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" "$HOME/.yarn-cache/stamp" || { echo "bytes mismatch"; exit 1; }
+
+  node-yarn2:
+    name: 'compat: Node Yarn 2'
+    needs: build-dist
+    runs-on: ubuntu-latest
+    permissions: { id-token: write, contents: read }
+    env:
+      BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}
+      KEY_NS: compat-${{ github.run_id }}-${{ github.run_attempt }}-
+    defaults: { run: { shell: bash } }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - id: yarn-cache-dir-path
+        name: Stub yarn 2 cache directory
+        run: |
+          mkdir -p "$HOME/.yarn2-cache"
+          echo "dir=$HOME/.yarn2-cache" >> $GITHUB_OUTPUT
+      - name: Seed yarn.lock (hash A)
+        run: |
+          echo '__metadata: A-y2' > yarn.lock
+      - name: Seed cache payload
+        run: echo "marker-$GITHUB_RUN_ID-A" > "$HOME/.yarn2-cache/stamp"
+      - name: Save
+        uses: ./save
+        with:
+          audience: https://cache.buildrush.dev
+          path: ${{ steps.yarn-cache-dir-path.outputs.dir }}
+          key: ${{ env.KEY_NS }}${{ runner.os }}-yarn-${{ hashFiles('**/yarn.lock') }}
+      - name: Wipe
+        run: rm -rf "$HOME/.yarn2-cache"
+      - id: yarn-cache
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: ${{ steps.yarn-cache-dir-path.outputs.dir }}
+          key: ${{ env.KEY_NS }}${{ runner.os }}-yarn-${{ hashFiles('**/yarn.lock') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-yarn-
+      - name: Assert hit + record primary
+        env:
+          HIT: ${{ steps.yarn-cache.outputs.cache-hit }}
+          MATCHED: ${{ steps.yarn-cache.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "true" || { echo "expected hit"; exit 1; }
+          test -n "$MATCHED" || { echo "matched empty"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" "$HOME/.yarn2-cache/stamp" || { echo "bytes mismatch"; exit 1; }
+          echo "PRIOR_PRIMARY=$MATCHED" >> "$GITHUB_ENV"
+      - name: Bump yarn.lock to B
+        run: |
+          echo '__metadata: B-y2' > yarn.lock
+      - run: rm -rf "$HOME/.yarn2-cache"
+      - id: yarn-cache-2
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: ${{ steps.yarn-cache-dir-path.outputs.dir }}
+          key: ${{ env.KEY_NS }}${{ runner.os }}-yarn-${{ hashFiles('**/yarn.lock') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-yarn-
+      - name: Assert fallback
+        env:
+          HIT: ${{ steps.yarn-cache-2.outputs.cache-hit }}
+          MATCHED: ${{ steps.yarn-cache-2.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "false" || { echo "expected miss"; exit 1; }
+          test "$MATCHED" = "$PRIOR_PRIMARY" || { echo "matched != prior primary"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" "$HOME/.yarn2-cache/stamp" || { echo "bytes mismatch"; exit 1; }
+
+  ocaml-esy:
+    name: 'compat: OCaml esy'
+    needs: build-dist
+    runs-on: ubuntu-latest
+    permissions: { id-token: write, contents: read }
+    env:
+      BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}
+      KEY_NS: compat-${{ github.run_id }}-${{ github.run_attempt }}-
+    defaults: { run: { shell: bash } }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - name: Seed esy.lock/index.json (hash A)
+        run: |
+          mkdir -p esy.lock
+          echo '{"hash":"A"}' > esy.lock/index.json
+      - name: Seed _export payload
+        run: |
+          mkdir -p _export
+          echo "marker-$GITHUB_RUN_ID-A" > _export/stamp
+      - name: Save
+        uses: ./save
+        with:
+          audience: https://cache.buildrush.dev
+          path: _export
+          key: ${{ env.KEY_NS }}${{ runner.os }}-esy-${{ hashFiles('esy.lock/index.json') }}
+      - name: Wipe
+        run: rm -rf _export
+      - id: restore-cache
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: _export
+          key: ${{ env.KEY_NS }}${{ runner.os }}-esy-${{ hashFiles('esy.lock/index.json') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-esy-
+      - name: Assert hit + record primary
+        env:
+          HIT: ${{ steps.restore-cache.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-cache.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "true" || { echo "expected hit"; exit 1; }
+          test -n "$MATCHED" || { echo "matched empty"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" _export/stamp || { echo "bytes mismatch"; exit 1; }
+          echo "PRIOR_PRIMARY=$MATCHED" >> "$GITHUB_ENV"
+      - name: Bump esy.lock/index.json to B
+        run: echo '{"hash":"B"}' > esy.lock/index.json
+      - run: rm -rf _export
+      - id: restore-cache-2
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: _export
+          key: ${{ env.KEY_NS }}${{ runner.os }}-esy-${{ hashFiles('esy.lock/index.json') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-esy-
+      - name: Assert fallback
+        env:
+          HIT: ${{ steps.restore-cache-2.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-cache-2.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "false" || { echo "expected miss"; exit 1; }
+          test "$MATCHED" = "$PRIOR_PRIMARY" || { echo "matched != prior primary"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" _export/stamp || { echo "bytes mismatch"; exit 1; }
+
+  go-linux:
+    name: 'compat: Go (Linux)'
+    needs: build-dist
+    runs-on: ubuntu-latest
+    permissions: { id-token: write, contents: read }
+    env:
+      BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}
+      KEY_NS: compat-${{ github.run_id }}-${{ github.run_attempt }}-
+    defaults: { run: { shell: bash } }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - name: Seed go.sum (hash A)
+        run: echo "hash-A" > go.sum
+      - name: Seed cache payloads
+        run: |
+          mkdir -p "$HOME/.cache/go-build" "$HOME/go/pkg/mod"
+          echo "marker-$GITHUB_RUN_ID-A" > "$HOME/.cache/go-build/stamp"
+          echo "marker-$GITHUB_RUN_ID-A" > "$HOME/go/pkg/mod/stamp"
+      - name: Save
+        uses: ./save
+        with:
+          audience: https://cache.buildrush.dev
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ env.KEY_NS }}${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+      - name: Wipe
+        run: rm -rf "$HOME/.cache/go-build" "$HOME/go/pkg/mod"
+      - id: restore-positive
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ env.KEY_NS }}${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-go-
+      - name: Assert hit + record primary
+        env:
+          HIT: ${{ steps.restore-positive.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-positive.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "true" || { echo "expected hit, got $HIT"; exit 1; }
+          test -n "$MATCHED" || { echo "matched empty"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" "$HOME/.cache/go-build/stamp" || { echo "go-build bytes mismatch"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" "$HOME/go/pkg/mod/stamp" || { echo "pkg/mod bytes mismatch"; exit 1; }
+          echo "PRIOR_PRIMARY=$MATCHED" >> "$GITHUB_ENV"
+      - name: Bump go.sum to B
+        run: echo "hash-B" > go.sum
+      - run: rm -rf "$HOME/.cache/go-build" "$HOME/go/pkg/mod"
+      - id: restore-fallback
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ env.KEY_NS }}${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-go-
+      - name: Assert fallback
+        env:
+          HIT: ${{ steps.restore-fallback.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-fallback.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "false" || { echo "expected miss"; exit 1; }
+          test "$MATCHED" = "$PRIOR_PRIMARY" || { echo "matched != prior primary"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" "$HOME/.cache/go-build/stamp" || { echo "go-build bytes mismatch"; exit 1; }
+
+  go-macos:
+    name: 'compat: Go (macOS)'
+    needs: build-dist
+    runs-on: macos-latest
+    permissions: { id-token: write, contents: read }
+    env:
+      BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}
+      KEY_NS: compat-${{ github.run_id }}-${{ github.run_attempt }}-
+    defaults: { run: { shell: bash } }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - name: Seed go.sum (hash A)
+        run: echo "hash-A" > go.sum
+      - name: Seed cache payloads
+        run: |
+          mkdir -p "$HOME/Library/Caches/go-build" "$HOME/go/pkg/mod"
+          echo "marker-$GITHUB_RUN_ID-A" > "$HOME/Library/Caches/go-build/stamp"
+          echo "marker-$GITHUB_RUN_ID-A" > "$HOME/go/pkg/mod/stamp"
+      - name: Save
+        uses: ./save
+        with:
+          audience: https://cache.buildrush.dev
+          path: |
+            ~/Library/Caches/go-build
+            ~/go/pkg/mod
+          key: ${{ env.KEY_NS }}${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+      - name: Wipe
+        run: rm -rf "$HOME/Library/Caches/go-build" "$HOME/go/pkg/mod"
+      - id: restore-positive
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: |
+            ~/Library/Caches/go-build
+            ~/go/pkg/mod
+          key: ${{ env.KEY_NS }}${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-go-
+      - name: Assert hit + record primary
+        env:
+          HIT: ${{ steps.restore-positive.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-positive.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "true" || { echo "expected hit, got $HIT"; exit 1; }
+          test -n "$MATCHED" || { echo "matched empty"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" "$HOME/Library/Caches/go-build/stamp" || { echo "go-build bytes mismatch"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" "$HOME/go/pkg/mod/stamp" || { echo "pkg/mod bytes mismatch"; exit 1; }
+          echo "PRIOR_PRIMARY=$MATCHED" >> "$GITHUB_ENV"
+      - name: Bump go.sum to B
+        run: echo "hash-B" > go.sum
+      - run: rm -rf "$HOME/Library/Caches/go-build" "$HOME/go/pkg/mod"
+      - id: restore-fallback
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: |
+            ~/Library/Caches/go-build
+            ~/go/pkg/mod
+          key: ${{ env.KEY_NS }}${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-go-
+      - name: Assert fallback
+        env:
+          HIT: ${{ steps.restore-fallback.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-fallback.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "false" || { echo "expected miss"; exit 1; }
+          test "$MATCHED" = "$PRIOR_PRIMARY" || { echo "matched != prior primary"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" "$HOME/Library/Caches/go-build/stamp" || { echo "go-build bytes mismatch"; exit 1; }
+
+  go-windows:
+    name: 'compat: Go (Windows)'
+    needs: build-dist
+    runs-on: windows-latest
+    permissions: { id-token: write, contents: read }
+    env:
+      BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}
+      KEY_NS: compat-${{ github.run_id }}-${{ github.run_attempt }}-
+    defaults: { run: { shell: bash } }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - name: Seed go.sum (hash A)
+        run: echo "hash-A" > go.sum
+      - name: Seed cache payloads
+        run: |
+          mkdir -p "$HOME/AppData/Local/go-build" "$HOME/go/pkg/mod"
+          echo "marker-$GITHUB_RUN_ID-A" > "$HOME/AppData/Local/go-build/stamp"
+          echo "marker-$GITHUB_RUN_ID-A" > "$HOME/go/pkg/mod/stamp"
+      - name: Save
+        uses: ./save
+        with:
+          audience: https://cache.buildrush.dev
+          path: |
+            ~\AppData\Local\go-build
+            ~\go\pkg\mod
+          key: ${{ env.KEY_NS }}${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+      - name: Wipe
+        run: rm -rf "$HOME/AppData/Local/go-build" "$HOME/go/pkg/mod"
+      - id: restore-positive
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: |
+            ~\AppData\Local\go-build
+            ~\go\pkg\mod
+          key: ${{ env.KEY_NS }}${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-go-
+      - name: Assert hit + record primary
+        env:
+          HIT: ${{ steps.restore-positive.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-positive.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "true" || { echo "expected hit, got $HIT"; exit 1; }
+          test -n "$MATCHED" || { echo "matched empty"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" "$HOME/AppData/Local/go-build/stamp" || { echo "go-build bytes mismatch"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" "$HOME/go/pkg/mod/stamp" || { echo "pkg/mod bytes mismatch"; exit 1; }
+          echo "PRIOR_PRIMARY=$MATCHED" >> "$GITHUB_ENV"
+      - name: Bump go.sum to B
+        run: echo "hash-B" > go.sum
+      - run: rm -rf "$HOME/AppData/Local/go-build" "$HOME/go/pkg/mod"
+      - id: restore-fallback
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: |
+            ~\AppData\Local\go-build
+            ~\go\pkg\mod
+          key: ${{ env.KEY_NS }}${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-go-
+      - name: Assert fallback
+        env:
+          HIT: ${{ steps.restore-fallback.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-fallback.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "false" || { echo "expected miss"; exit 1; }
+          test "$MATCHED" = "$PRIOR_PRIMARY" || { echo "matched != prior primary"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" "$HOME/AppData/Local/go-build/stamp" || { echo "go-build bytes mismatch"; exit 1; }
+
+  dub-linux:
+    name: 'compat: DUB (Linux)'
+    needs: build-dist
+    runs-on: ubuntu-latest
+    permissions: { id-token: write, contents: read }
+    env:
+      BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}
+      KEY_NS: compat-${{ github.run_id }}-${{ github.run_attempt }}-
+    defaults: { run: { shell: bash } }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - name: Seed dub.selections.json (hash A)
+        run: echo '{"fileVersion":1,"versions":{"a":"1.0.0"}}' > dub.selections.json
+      - name: Seed cache payload
+        run: |
+          mkdir -p "$HOME/.dub"
+          echo "marker-$GITHUB_RUN_ID-A" > "$HOME/.dub/stamp"
+      - name: Save
+        uses: ./save
+        with:
+          audience: https://cache.buildrush.dev
+          path: ~/.dub
+          key: ${{ env.KEY_NS }}${{ runner.os }}-dub-${{ hashFiles('**/dub.selections.json') }}
+      - name: Wipe
+        run: rm -rf "$HOME/.dub"
+      - id: restore-positive
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: ~/.dub
+          key: ${{ env.KEY_NS }}${{ runner.os }}-dub-${{ hashFiles('**/dub.selections.json') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-dub-
+      - name: Assert hit + record primary
+        env:
+          HIT: ${{ steps.restore-positive.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-positive.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "true" || { echo "expected hit"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" "$HOME/.dub/stamp" || { echo "bytes mismatch"; exit 1; }
+          echo "PRIOR_PRIMARY=$MATCHED" >> "$GITHUB_ENV"
+      - name: Bump dub.selections.json to B
+        run: echo '{"fileVersion":1,"versions":{"b":"1.0.0"}}' > dub.selections.json
+      - run: rm -rf "$HOME/.dub"
+      - id: restore-fallback
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: ~/.dub
+          key: ${{ env.KEY_NS }}${{ runner.os }}-dub-${{ hashFiles('**/dub.selections.json') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-dub-
+      - name: Assert fallback
+        env:
+          HIT: ${{ steps.restore-fallback.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-fallback.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "false" || { echo "expected miss"; exit 1; }
+          test "$MATCHED" = "$PRIOR_PRIMARY" || { echo "matched != prior primary"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" "$HOME/.dub/stamp" || { echo "bytes mismatch"; exit 1; }
+
+  dub-windows:
+    name: 'compat: DUB (Windows)'
+    needs: build-dist
+    runs-on: windows-latest
+    permissions: { id-token: write, contents: read }
+    env:
+      BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}
+      KEY_NS: compat-${{ github.run_id }}-${{ github.run_attempt }}-
+    defaults: { run: { shell: bash } }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - name: Seed dub.selections.json (hash A)
+        run: echo '{"fileVersion":1,"versions":{"a":"1.0.0"}}' > dub.selections.json
+      - name: Seed cache payload
+        run: |
+          mkdir -p "$HOME/AppData/Local/dub"
+          echo "marker-$GITHUB_RUN_ID-A" > "$HOME/AppData/Local/dub/stamp"
+      - name: Save
+        uses: ./save
+        with:
+          audience: https://cache.buildrush.dev
+          path: ~\AppData\Local\dub
+          key: ${{ env.KEY_NS }}${{ runner.os }}-dub-${{ hashFiles('**/dub.selections.json') }}
+      - name: Wipe
+        run: rm -rf "$HOME/AppData/Local/dub"
+      - id: restore-positive
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: ~\AppData\Local\dub
+          key: ${{ env.KEY_NS }}${{ runner.os }}-dub-${{ hashFiles('**/dub.selections.json') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-dub-
+      - name: Assert hit + record primary
+        env:
+          HIT: ${{ steps.restore-positive.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-positive.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "true" || { echo "expected hit"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" "$HOME/AppData/Local/dub/stamp" || { echo "bytes mismatch"; exit 1; }
+          echo "PRIOR_PRIMARY=$MATCHED" >> "$GITHUB_ENV"
+      - name: Bump dub.selections.json to B
+        run: echo '{"fileVersion":1,"versions":{"b":"1.0.0"}}' > dub.selections.json
+      - run: rm -rf "$HOME/AppData/Local/dub"
+      - id: restore-fallback
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: ~\AppData\Local\dub
+          key: ${{ env.KEY_NS }}${{ runner.os }}-dub-${{ hashFiles('**/dub.selections.json') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-dub-
+      - name: Assert fallback
+        env:
+          HIT: ${{ steps.restore-fallback.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-fallback.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "false" || { echo "expected miss"; exit 1; }
+          test "$MATCHED" = "$PRIOR_PRIMARY" || { echo "matched != prior primary"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" "$HOME/AppData/Local/dub/stamp" || { echo "bytes mismatch"; exit 1; }
+
+  haskell-stack-linux:
+    name: 'compat: Haskell Stack (Linux)'
+    needs: build-dist
+    runs-on: ubuntu-latest
+    permissions: { id-token: write, contents: read }
+    env:
+      BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}
+      KEY_NS: compat-${{ github.run_id }}-${{ github.run_attempt }}-
+    defaults: { run: { shell: bash } }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - name: Seed lockfiles (A)
+        run: |
+          echo 'resolver: lts-22.0' > stack.yaml
+          echo 'name: a' > package.yaml
+          mkdir -p app
+          echo 'main = putStrLn "A"' > app/Main.hs
+      - name: Seed payloads
+        run: |
+          mkdir -p "$HOME/.stack" .stack-work
+          echo "stack-global-$GITHUB_RUN_ID-A" > "$HOME/.stack/stamp"
+          echo "stack-work-$GITHUB_RUN_ID-A" > .stack-work/stamp
+
+      # Round-trip 1: ~/.stack (global)
+      - name: Save ~/.stack (global)
+        uses: ./save
+        with:
+          audience: https://cache.buildrush.dev
+          path: ~/.stack
+          key: ${{ env.KEY_NS }}${{ runner.os }}-stack-global-${{ hashFiles('stack.yaml') }}-${{ hashFiles('package.yaml') }}
+      - run: rm -rf "$HOME/.stack"
+      - id: stack-global-positive
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: ~/.stack
+          key: ${{ env.KEY_NS }}${{ runner.os }}-stack-global-${{ hashFiles('stack.yaml') }}-${{ hashFiles('package.yaml') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-stack-global-
+      - name: Assert ~/.stack hit + record primary
+        env:
+          HIT: ${{ steps.stack-global-positive.outputs.cache-hit }}
+          MATCHED: ${{ steps.stack-global-positive.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "true" || { echo "stack-global expected hit, got $HIT"; exit 1; }
+          grep -q "stack-global-$GITHUB_RUN_ID-A" "$HOME/.stack/stamp" || { echo "stack-global bytes mismatch"; exit 1; }
+          echo "STACK_GLOBAL_PRIMARY=$MATCHED" >> "$GITHUB_ENV"
+
+      # Round-trip 2: .stack-work (build artifacts)
+      - name: Save .stack-work
+        uses: ./save
+        with:
+          audience: https://cache.buildrush.dev
+          path: .stack-work
+          key: ${{ env.KEY_NS }}${{ runner.os }}-stack-work-${{ hashFiles('stack.yaml') }}-${{ hashFiles('package.yaml') }}-${{ hashFiles('**/*.hs') }}
+      - run: rm -rf .stack-work
+      - id: stack-work-positive
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: .stack-work
+          key: ${{ env.KEY_NS }}${{ runner.os }}-stack-work-${{ hashFiles('stack.yaml') }}-${{ hashFiles('package.yaml') }}-${{ hashFiles('**/*.hs') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-stack-work-
+      - name: Assert .stack-work hit + record primary
+        env:
+          HIT: ${{ steps.stack-work-positive.outputs.cache-hit }}
+          MATCHED: ${{ steps.stack-work-positive.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "true" || { echo "stack-work expected hit, got $HIT"; exit 1; }
+          grep -q "stack-work-$GITHUB_RUN_ID-A" .stack-work/stamp || { echo "stack-work bytes mismatch"; exit 1; }
+          echo "STACK_WORK_PRIMARY=$MATCHED" >> "$GITHUB_ENV"
+
+      # Bump lockfiles, fallback both caches
+      - name: Bump lockfiles to B
+        run: |
+          echo 'resolver: lts-22.1' > stack.yaml
+          echo 'name: b' > package.yaml
+          echo 'main = putStrLn "B"' > app/Main.hs
+      - run: rm -rf "$HOME/.stack" .stack-work
+
+      - id: stack-global-fallback
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: ~/.stack
+          key: ${{ env.KEY_NS }}${{ runner.os }}-stack-global-${{ hashFiles('stack.yaml') }}-${{ hashFiles('package.yaml') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-stack-global-
+      - name: Assert ~/.stack fallback
+        env:
+          HIT: ${{ steps.stack-global-fallback.outputs.cache-hit }}
+          MATCHED: ${{ steps.stack-global-fallback.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "false" || { echo "stack-global expected miss"; exit 1; }
+          test "$MATCHED" = "$STACK_GLOBAL_PRIMARY" || { echo "matched != prior global primary"; exit 1; }
+          grep -q "stack-global-$GITHUB_RUN_ID-A" "$HOME/.stack/stamp" || { echo "fallback global bytes mismatch"; exit 1; }
+
+      - id: stack-work-fallback
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: .stack-work
+          key: ${{ env.KEY_NS }}${{ runner.os }}-stack-work-${{ hashFiles('stack.yaml') }}-${{ hashFiles('package.yaml') }}-${{ hashFiles('**/*.hs') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-stack-work-
+      - name: Assert .stack-work fallback
+        env:
+          HIT: ${{ steps.stack-work-fallback.outputs.cache-hit }}
+          MATCHED: ${{ steps.stack-work-fallback.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "false" || { echo "stack-work expected miss"; exit 1; }
+          test "$MATCHED" = "$STACK_WORK_PRIMARY" || { echo "matched != prior work primary"; exit 1; }
+          grep -q "stack-work-$GITHUB_RUN_ID-A" .stack-work/stamp || { echo "fallback work bytes mismatch"; exit 1; }
+
+  haskell-stack-windows:
+    name: 'compat: Haskell Stack (Windows)'
+    needs: build-dist
+    runs-on: windows-latest
+    permissions: { id-token: write, contents: read }
+    env:
+      BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}
+      KEY_NS: compat-${{ github.run_id }}-${{ github.run_attempt }}-
+    defaults: { run: { shell: bash } }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - name: Seed lockfiles (A)
+        run: |
+          echo 'resolver: lts-22.0' > stack.yaml
+          echo 'name: a' > package.yaml
+          mkdir -p app
+          echo 'main = putStrLn "A"' > app/Main.hs
+      - name: Seed payloads
+        run: |
+          mkdir -p "$HOME/AppData/Roaming/stack" "$HOME/AppData/Local/Programs/stack" .stack-work
+          echo "stack-global-roaming-$GITHUB_RUN_ID-A" > "$HOME/AppData/Roaming/stack/stamp"
+          echo "stack-global-programs-$GITHUB_RUN_ID-A" > "$HOME/AppData/Local/Programs/stack/stamp"
+          echo "stack-work-$GITHUB_RUN_ID-A" > .stack-work/stamp
+
+      # Round-trip 1: global (~/AppData/Roaming/stack + ~/AppData/Local/Programs/stack)
+      - name: Save global
+        uses: ./save
+        with:
+          audience: https://cache.buildrush.dev
+          path: |
+            ~\AppData\Roaming\stack
+            ~\AppData\Local\Programs\stack
+          key: ${{ env.KEY_NS }}${{ runner.os }}-stack-global-${{ hashFiles('stack.yaml') }}-${{ hashFiles('package.yaml') }}
+      - run: rm -rf "$HOME/AppData/Roaming/stack" "$HOME/AppData/Local/Programs/stack"
+      - id: stack-global-positive
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: |
+            ~\AppData\Roaming\stack
+            ~\AppData\Local\Programs\stack
+          key: ${{ env.KEY_NS }}${{ runner.os }}-stack-global-${{ hashFiles('stack.yaml') }}-${{ hashFiles('package.yaml') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-stack-global-
+      - name: Assert global hit + record primary
+        env:
+          HIT: ${{ steps.stack-global-positive.outputs.cache-hit }}
+          MATCHED: ${{ steps.stack-global-positive.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "true" || { echo "stack-global expected hit, got $HIT"; exit 1; }
+          grep -q "stack-global-roaming-$GITHUB_RUN_ID-A" "$HOME/AppData/Roaming/stack/stamp" || { echo "roaming bytes mismatch"; exit 1; }
+          grep -q "stack-global-programs-$GITHUB_RUN_ID-A" "$HOME/AppData/Local/Programs/stack/stamp" || { echo "programs bytes mismatch"; exit 1; }
+          echo "STACK_GLOBAL_PRIMARY=$MATCHED" >> "$GITHUB_ENV"
+
+      # Round-trip 2: .stack-work (build artifacts)
+      - name: Save .stack-work
+        uses: ./save
+        with:
+          audience: https://cache.buildrush.dev
+          path: .stack-work
+          key: ${{ env.KEY_NS }}${{ runner.os }}-stack-work-${{ hashFiles('stack.yaml') }}-${{ hashFiles('package.yaml') }}-${{ hashFiles('**/*.hs') }}
+      - run: rm -rf .stack-work
+      - id: stack-work-positive
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: .stack-work
+          key: ${{ env.KEY_NS }}${{ runner.os }}-stack-work-${{ hashFiles('stack.yaml') }}-${{ hashFiles('package.yaml') }}-${{ hashFiles('**/*.hs') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-stack-work-
+      - name: Assert .stack-work hit + record primary
+        env:
+          HIT: ${{ steps.stack-work-positive.outputs.cache-hit }}
+          MATCHED: ${{ steps.stack-work-positive.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "true" || { echo "stack-work expected hit, got $HIT"; exit 1; }
+          grep -q "stack-work-$GITHUB_RUN_ID-A" .stack-work/stamp || { echo "stack-work bytes mismatch"; exit 1; }
+          echo "STACK_WORK_PRIMARY=$MATCHED" >> "$GITHUB_ENV"
+
+      # Bump lockfiles, fallback both caches
+      - name: Bump lockfiles to B
+        run: |
+          echo 'resolver: lts-22.1' > stack.yaml
+          echo 'name: b' > package.yaml
+          echo 'main = putStrLn "B"' > app/Main.hs
+      - run: rm -rf "$HOME/AppData/Roaming/stack" "$HOME/AppData/Local/Programs/stack" .stack-work
+
+      - id: stack-global-fallback
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: |
+            ~\AppData\Roaming\stack
+            ~\AppData\Local\Programs\stack
+          key: ${{ env.KEY_NS }}${{ runner.os }}-stack-global-${{ hashFiles('stack.yaml') }}-${{ hashFiles('package.yaml') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-stack-global-
+      - name: Assert global fallback
+        env:
+          HIT: ${{ steps.stack-global-fallback.outputs.cache-hit }}
+          MATCHED: ${{ steps.stack-global-fallback.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "false" || { echo "stack-global expected miss"; exit 1; }
+          test "$MATCHED" = "$STACK_GLOBAL_PRIMARY" || { echo "matched != prior global primary"; exit 1; }
+          grep -q "stack-global-roaming-$GITHUB_RUN_ID-A" "$HOME/AppData/Roaming/stack/stamp" || { echo "roaming bytes mismatch"; exit 1; }
+          grep -q "stack-global-programs-$GITHUB_RUN_ID-A" "$HOME/AppData/Local/Programs/stack/stamp" || { echo "programs bytes mismatch"; exit 1; }
+
+      - id: stack-work-fallback
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: .stack-work
+          key: ${{ env.KEY_NS }}${{ runner.os }}-stack-work-${{ hashFiles('stack.yaml') }}-${{ hashFiles('package.yaml') }}-${{ hashFiles('**/*.hs') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-stack-work-
+      - name: Assert .stack-work fallback
+        env:
+          HIT: ${{ steps.stack-work-fallback.outputs.cache-hit }}
+          MATCHED: ${{ steps.stack-work-fallback.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "false" || { echo "stack-work expected miss"; exit 1; }
+          test "$MATCHED" = "$STACK_WORK_PRIMARY" || { echo "matched != prior work primary"; exit 1; }
+          grep -q "stack-work-$GITHUB_RUN_ID-A" .stack-work/stamp || { echo "fallback work bytes mismatch"; exit 1; }
+
+  bazel-linux:
+    name: 'compat: Bazel (Linux)'
+    needs: build-dist
+    runs-on: ubuntu-latest
+    permissions: { id-token: write, contents: read }
+    env:
+      BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}
+      KEY_NS: compat-${{ github.run_id }}-${{ github.run_attempt }}-
+    defaults: { run: { shell: bash } }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - name: Seed bazel lockfiles (A)
+        run: |
+          echo '7.0.0' > .bazelversion
+          echo '# config A' > .bazelrc
+          echo 'workspace(name = "a")' > WORKSPACE
+          echo 'workspace(name = "a-bzl")' > WORKSPACE.bazel
+          echo 'module(name = "a")' > MODULE.bazel
+      - name: Seed cache payload
+        run: |
+          mkdir -p "$HOME/.cache/bazel"
+          echo "marker-$GITHUB_RUN_ID-A" > "$HOME/.cache/bazel/stamp"
+      - name: Save
+        uses: ./save
+        with:
+          audience: https://cache.buildrush.dev
+          path: |
+            ~/.cache/bazel
+          key: ${{ env.KEY_NS }}${{ runner.os }}-bazel-${{ hashFiles('.bazelversion', '.bazelrc', 'WORKSPACE', 'WORKSPACE.bazel', 'MODULE.bazel') }}
+      - name: Wipe
+        run: rm -rf "$HOME/.cache/bazel"
+      - id: restore-positive
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: |
+            ~/.cache/bazel
+          key: ${{ env.KEY_NS }}${{ runner.os }}-bazel-${{ hashFiles('.bazelversion', '.bazelrc', 'WORKSPACE', 'WORKSPACE.bazel', 'MODULE.bazel') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-bazel-
+      - name: Assert hit + record primary
+        env:
+          HIT: ${{ steps.restore-positive.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-positive.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "true" || { echo "expected hit"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" "$HOME/.cache/bazel/stamp" || { echo "bytes mismatch"; exit 1; }
+          echo "PRIOR_PRIMARY=$MATCHED" >> "$GITHUB_ENV"
+      - name: Bump bazel lockfiles to B
+        run: |
+          echo '7.0.1' > .bazelversion
+          echo '# config B' > .bazelrc
+          echo 'workspace(name = "b")' > WORKSPACE
+          echo 'workspace(name = "b-bzl")' > WORKSPACE.bazel
+          echo 'module(name = "b")' > MODULE.bazel
+      - run: rm -rf "$HOME/.cache/bazel"
+      - id: restore-fallback
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: |
+            ~/.cache/bazel
+          key: ${{ env.KEY_NS }}${{ runner.os }}-bazel-${{ hashFiles('.bazelversion', '.bazelrc', 'WORKSPACE', 'WORKSPACE.bazel', 'MODULE.bazel') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-bazel-
+      - name: Assert fallback
+        env:
+          HIT: ${{ steps.restore-fallback.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-fallback.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "false" || { echo "expected miss"; exit 1; }
+          test "$MATCHED" = "$PRIOR_PRIMARY" || { echo "matched != prior primary"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" "$HOME/.cache/bazel/stamp" || { echo "bytes mismatch"; exit 1; }
+
+  bazel-macos:
+    name: 'compat: Bazel (macOS)'
+    needs: build-dist
+    runs-on: macos-latest
+    permissions: { id-token: write, contents: read }
+    env:
+      BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}
+      KEY_NS: compat-${{ github.run_id }}-${{ github.run_attempt }}-
+    defaults: { run: { shell: bash } }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - name: Seed bazel lockfiles (A)
+        run: |
+          echo '7.0.0' > .bazelversion
+          echo '# config A' > .bazelrc
+          echo 'workspace(name = "a")' > WORKSPACE
+          echo 'workspace(name = "a-bzl")' > WORKSPACE.bazel
+          echo 'module(name = "a")' > MODULE.bazel
+      - name: Seed cache payload
+        run: |
+          sudo mkdir -p /private/var/tmp/_bazel_runner
+          sudo chown -R "$USER" /private/var/tmp/_bazel_runner
+          echo "marker-$GITHUB_RUN_ID-A" > /private/var/tmp/_bazel_runner/stamp
+      - name: Save
+        uses: ./save
+        with:
+          audience: https://cache.buildrush.dev
+          path: |
+            /private/var/tmp/_bazel_runner/
+          key: ${{ env.KEY_NS }}${{ runner.os }}-bazel-${{ hashFiles('.bazelversion', '.bazelrc', 'WORKSPACE', 'WORKSPACE.bazel', 'MODULE.bazel') }}
+      - name: Wipe
+        run: sudo rm -rf /private/var/tmp/_bazel_runner
+      - id: restore-positive
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: |
+            /private/var/tmp/_bazel_runner/
+          key: ${{ env.KEY_NS }}${{ runner.os }}-bazel-${{ hashFiles('.bazelversion', '.bazelrc', 'WORKSPACE', 'WORKSPACE.bazel', 'MODULE.bazel') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-bazel-
+      - name: Assert hit + record primary
+        env:
+          HIT: ${{ steps.restore-positive.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-positive.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "true" || { echo "expected hit"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" /private/var/tmp/_bazel_runner/stamp || { echo "bytes mismatch"; exit 1; }
+          echo "PRIOR_PRIMARY=$MATCHED" >> "$GITHUB_ENV"
+      - name: Bump bazel lockfiles to B
+        run: |
+          echo '7.0.1' > .bazelversion
+          echo '# config B' > .bazelrc
+          echo 'workspace(name = "b")' > WORKSPACE
+          echo 'workspace(name = "b-bzl")' > WORKSPACE.bazel
+          echo 'module(name = "b")' > MODULE.bazel
+      - run: sudo rm -rf /private/var/tmp/_bazel_runner
+      - id: restore-fallback
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: |
+            /private/var/tmp/_bazel_runner/
+          key: ${{ env.KEY_NS }}${{ runner.os }}-bazel-${{ hashFiles('.bazelversion', '.bazelrc', 'WORKSPACE', 'WORKSPACE.bazel', 'MODULE.bazel') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-bazel-
+      - name: Assert fallback
+        env:
+          HIT: ${{ steps.restore-fallback.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-fallback.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "false" || { echo "expected miss"; exit 1; }
+          test "$MATCHED" = "$PRIOR_PRIMARY" || { echo "matched != prior primary"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" /private/var/tmp/_bazel_runner/stamp || { echo "bytes mismatch"; exit 1; }
+
+  haskell-cabal:
+    name: 'compat: Haskell Cabal'
+    needs: build-dist
+    runs-on: ubuntu-latest
+    permissions: { id-token: write, contents: read }
+    env:
+      BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}
+      KEY_NS: compat-${{ github.run_id }}-${{ github.run_attempt }}-
+      GHC_VERSION: '9.6.4'
+    defaults: { run: { shell: bash } }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - name: Seed cabal lockfiles (A)
+        run: |
+          echo 'name: a' > a.cabal
+          echo 'packages: .' > cabal.project
+          echo 'constraints: a == 1.0' > cabal.project.freeze
+      - name: Seed cache payloads
+        run: |
+          mkdir -p "$HOME/.cabal/packages" "$HOME/.cabal/store" dist-newstyle
+          echo "marker-pkgs-$GITHUB_RUN_ID-A" > "$HOME/.cabal/packages/stamp"
+          echo "marker-store-$GITHUB_RUN_ID-A" > "$HOME/.cabal/store/stamp"
+          echo "marker-dist-$GITHUB_RUN_ID-A" > dist-newstyle/stamp
+      - name: Save
+        uses: ./save
+        with:
+          audience: https://cache.buildrush.dev
+          path: |
+            ~/.cabal/packages
+            ~/.cabal/store
+            dist-newstyle
+          key: ${{ env.KEY_NS }}${{ runner.os }}-${{ env.GHC_VERSION }}-${{ hashFiles('**/*.cabal', '**/cabal.project', '**/cabal.project.freeze') }}
+      - name: Wipe
+        run: rm -rf "$HOME/.cabal/packages" "$HOME/.cabal/store" dist-newstyle
+      - id: restore-positive
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: |
+            ~/.cabal/packages
+            ~/.cabal/store
+            dist-newstyle
+          key: ${{ env.KEY_NS }}${{ runner.os }}-${{ env.GHC_VERSION }}-${{ hashFiles('**/*.cabal', '**/cabal.project', '**/cabal.project.freeze') }}
+          restore-keys: ${{ env.KEY_NS }}${{ runner.os }}-${{ env.GHC_VERSION }}-
+      - name: Assert hit + record primary
+        env:
+          HIT: ${{ steps.restore-positive.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-positive.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "true" || { echo "expected hit"; exit 1; }
+          grep -q "marker-pkgs-$GITHUB_RUN_ID-A" "$HOME/.cabal/packages/stamp" || { echo "pkgs bytes mismatch"; exit 1; }
+          grep -q "marker-store-$GITHUB_RUN_ID-A" "$HOME/.cabal/store/stamp" || { echo "store bytes mismatch"; exit 1; }
+          grep -q "marker-dist-$GITHUB_RUN_ID-A" dist-newstyle/stamp || { echo "dist bytes mismatch"; exit 1; }
+          echo "PRIOR_PRIMARY=$MATCHED" >> "$GITHUB_ENV"
+      - name: Bump cabal lockfiles to B
+        run: |
+          echo 'name: b' > a.cabal
+          echo 'packages: .' > cabal.project
+          echo 'constraints: b == 1.0' > cabal.project.freeze
+      - run: rm -rf "$HOME/.cabal/packages" "$HOME/.cabal/store" dist-newstyle
+      - id: restore-fallback
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: |
+            ~/.cabal/packages
+            ~/.cabal/store
+            dist-newstyle
+          key: ${{ env.KEY_NS }}${{ runner.os }}-${{ env.GHC_VERSION }}-${{ hashFiles('**/*.cabal', '**/cabal.project', '**/cabal.project.freeze') }}
+          restore-keys: ${{ env.KEY_NS }}${{ runner.os }}-${{ env.GHC_VERSION }}-
+      - name: Assert fallback
+        env:
+          HIT: ${{ steps.restore-fallback.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-fallback.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "false" || { echo "expected miss"; exit 1; }
+          test "$MATCHED" = "$PRIOR_PRIMARY" || { echo "matched != prior primary"; exit 1; }
+          grep -q "marker-pkgs-$GITHUB_RUN_ID-A" "$HOME/.cabal/packages/stamp" || { echo "pkgs bytes mismatch"; exit 1; }
+
+  node-lerna:
+    name: 'compat: Node Lerna'
+    needs: build-dist
+    runs-on: ubuntu-latest
+    permissions: { id-token: write, contents: read }
+    env:
+      BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}
+      KEY_NS: compat-${{ github.run_id }}-${{ github.run_attempt }}-
+    defaults: { run: { shell: bash } }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - name: Seed yarn.lock
+        run: |
+          echo '__metadata:'   > yarn.lock
+          echo '  version: 6'  >> yarn.lock
+      - name: Seed node_modules at multiple depths
+        run: |
+          mkdir -p node_modules packages/a/node_modules
+          echo "root-$GITHUB_RUN_ID" > node_modules/stamp
+          echo "package-a-$GITHUB_RUN_ID" > packages/a/node_modules/stamp
+      - name: Save
+        uses: ./save
+        with:
+          audience: https://cache.buildrush.dev
+          path: '**/node_modules'
+          key: ${{ env.KEY_NS }}${{ runner.os }}-${{ hashFiles('**/yarn.lock') }}
+      - name: Wipe
+        run: rm -rf node_modules packages
+      - id: restore
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: '**/node_modules'
+          key: ${{ env.KEY_NS }}${{ runner.os }}-${{ hashFiles('**/yarn.lock') }}
+      - name: Assert hit + bytes
+        env:
+          HIT: ${{ steps.restore.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "true" || { echo "expected hit"; exit 1; }
+          test -n "$MATCHED" || { echo "matched empty"; exit 1; }
+          grep -q "root-$GITHUB_RUN_ID" node_modules/stamp || { echo "root node_modules bytes mismatch"; exit 1; }
+          grep -q "package-a-$GITHUB_RUN_ID" packages/a/node_modules/stamp || { echo "nested node_modules bytes mismatch"; exit 1; }
+
+  python-pipenv:
+    name: 'compat: Python pipenv'
+    needs: build-dist
+    runs-on: ubuntu-latest
+    permissions: { id-token: write, contents: read }
+    env:
+      BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}
+      KEY_NS: compat-${{ github.run_id }}-${{ github.run_attempt }}-
+    defaults: { run: { shell: bash } }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - id: setup-python
+        uses: actions/setup-python@v6
+      - name: Seed Pipfile.lock
+        run: echo '{"_meta":{"hash":{"sha256":"A"}}}' > Pipfile.lock
+      - name: Seed cache payload
+        run: |
+          mkdir -p "$HOME/.local/share/virtualenvs"
+          echo "marker-$GITHUB_RUN_ID-A" > "$HOME/.local/share/virtualenvs/stamp"
+      - name: Save
+        uses: ./save
+        with:
+          audience: https://cache.buildrush.dev
+          path: ~/.local/share/virtualenvs
+          key: ${{ env.KEY_NS }}${{ runner.os }}-python-${{ steps.setup-python.outputs.python-version }}-pipenv-${{ hashFiles('Pipfile.lock') }}
+      - name: Wipe
+        run: rm -rf "$HOME/.local/share/virtualenvs"
+      - id: restore
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: ~/.local/share/virtualenvs
+          key: ${{ env.KEY_NS }}${{ runner.os }}-python-${{ steps.setup-python.outputs.python-version }}-pipenv-${{ hashFiles('Pipfile.lock') }}
+      - name: Assert hit + bytes
+        env:
+          HIT: ${{ steps.restore.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "true" || { echo "expected hit"; exit 1; }
+          test -n "$MATCHED" || { echo "matched empty"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" "$HOME/.local/share/virtualenvs/stamp" || { echo "bytes mismatch"; exit 1; }
+
+  rust-cargo:
+    name: 'compat: Rust Cargo'
+    needs: build-dist
+    runs-on: ubuntu-latest
+    permissions: { id-token: write, contents: read }
+    env:
+      BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}
+      KEY_NS: compat-${{ github.run_id }}-${{ github.run_attempt }}-
+    defaults: { run: { shell: bash } }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - name: Seed Cargo.lock
+        run: echo '# A' > Cargo.lock
+      - name: Seed cache payloads
+        run: |
+          mkdir -p "$HOME/.cargo/bin" "$HOME/.cargo/registry/index" "$HOME/.cargo/registry/cache" "$HOME/.cargo/git/db" target
+          echo "bin-$GITHUB_RUN_ID" > "$HOME/.cargo/bin/stamp"
+          echo "index-$GITHUB_RUN_ID" > "$HOME/.cargo/registry/index/stamp"
+          echo "cache-$GITHUB_RUN_ID" > "$HOME/.cargo/registry/cache/stamp"
+          echo "git-$GITHUB_RUN_ID" > "$HOME/.cargo/git/db/stamp"
+          echo "target-$GITHUB_RUN_ID" > target/stamp
+      - name: Save
+        uses: ./save
+        with:
+          audience: https://cache.buildrush.dev
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ env.KEY_NS }}${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: Wipe
+        run: rm -rf "$HOME/.cargo/bin" "$HOME/.cargo/registry" "$HOME/.cargo/git" target
+      - id: restore
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ env.KEY_NS }}${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: Assert hit + bytes
+        env:
+          HIT: ${{ steps.restore.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "true" || { echo "expected hit"; exit 1; }
+          test -n "$MATCHED" || { echo "matched empty"; exit 1; }
+          grep -q "bin-$GITHUB_RUN_ID" "$HOME/.cargo/bin/stamp" || { echo "bin bytes mismatch"; exit 1; }
+          grep -q "target-$GITHUB_RUN_ID" target/stamp || { echo "target bytes mismatch"; exit 1; }
+
+  scala-sbt:
+    name: 'compat: Scala SBT'
+    needs: build-dist
+    runs-on: ubuntu-latest
+    permissions: { id-token: write, contents: read }
+    env:
+      BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}
+      KEY_NS: compat-${{ github.run_id }}-${{ github.run_attempt }}-
+    defaults: { run: { shell: bash } }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - name: Seed build.sbt
+        run: echo 'version := "A"' > build.sbt
+      - name: Seed cache payloads
+        run: |
+          mkdir -p "$HOME/.ivy2/cache" "$HOME/.sbt"
+          echo "ivy-$GITHUB_RUN_ID" > "$HOME/.ivy2/cache/stamp"
+          echo "sbt-$GITHUB_RUN_ID" > "$HOME/.sbt/stamp"
+      - name: Save
+        uses: ./save
+        with:
+          audience: https://cache.buildrush.dev
+          path: |
+            ~/.ivy2/cache
+            ~/.sbt
+          key: ${{ env.KEY_NS }}${{ runner.os }}-sbt-${{ hashFiles('**/build.sbt') }}
+      - name: Wipe
+        run: rm -rf "$HOME/.ivy2/cache" "$HOME/.sbt"
+      - id: restore
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: |
+            ~/.ivy2/cache
+            ~/.sbt
+          key: ${{ env.KEY_NS }}${{ runner.os }}-sbt-${{ hashFiles('**/build.sbt') }}
+      - name: Assert hit + bytes
+        env:
+          HIT: ${{ steps.restore.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "true" || { echo "expected hit"; exit 1; }
+          test -n "$MATCHED" || { echo "matched empty"; exit 1; }
+          grep -q "ivy-$GITHUB_RUN_ID" "$HOME/.ivy2/cache/stamp" || { echo "ivy bytes mismatch"; exit 1; }
+          grep -q "sbt-$GITHUB_RUN_ID" "$HOME/.sbt/stamp" || { echo "sbt bytes mismatch"; exit 1; }
+
+  python-pip-simple-linux:
+    name: 'compat: Python pip (simple, Linux)'
+    needs: build-dist
+    runs-on: ubuntu-latest
+    permissions: { id-token: write, contents: read }
+    env:
+      BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}
+      KEY_NS: compat-${{ github.run_id }}-${{ github.run_attempt }}-
+    defaults: { run: { shell: bash } }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - name: Seed requirements.txt
+        run: echo 'flask==3.0.0' > requirements.txt
+      - name: Seed cache payload
+        run: |
+          mkdir -p "$HOME/.cache/pip"
+          echo "marker-$GITHUB_RUN_ID-A" > "$HOME/.cache/pip/stamp"
+      - name: Save
+        uses: ./save
+        with:
+          audience: https://cache.buildrush.dev
+          path: ~/.cache/pip
+          key: ${{ env.KEY_NS }}${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+      - name: Wipe
+        run: rm -rf "$HOME/.cache/pip"
+      - id: restore-positive
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: ~/.cache/pip
+          key: ${{ env.KEY_NS }}${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-pip-
+      - name: Assert hit + record primary
+        env:
+          HIT: ${{ steps.restore-positive.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-positive.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "true" || { echo "expected hit"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" "$HOME/.cache/pip/stamp" || { echo "bytes mismatch"; exit 1; }
+          echo "PRIOR_PRIMARY=$MATCHED" >> "$GITHUB_ENV"
+      - name: Bump requirements.txt to B
+        run: echo 'flask==3.0.1' > requirements.txt
+      - run: rm -rf "$HOME/.cache/pip"
+      - id: restore-fallback
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: ~/.cache/pip
+          key: ${{ env.KEY_NS }}${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-pip-
+      - name: Assert fallback
+        env:
+          HIT: ${{ steps.restore-fallback.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-fallback.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "false" || { echo "expected miss"; exit 1; }
+          test "$MATCHED" = "$PRIOR_PRIMARY" || { echo "matched != prior primary"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" "$HOME/.cache/pip/stamp" || { echo "bytes mismatch"; exit 1; }
+
+  python-pip-simple-macos:
+    name: 'compat: Python pip (simple, macOS)'
+    needs: build-dist
+    runs-on: macos-latest
+    permissions: { id-token: write, contents: read }
+    env:
+      BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}
+      KEY_NS: compat-${{ github.run_id }}-${{ github.run_attempt }}-
+    defaults: { run: { shell: bash } }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - name: Seed requirements.txt
+        run: echo 'flask==3.0.0' > requirements.txt
+      - name: Seed cache payload
+        run: |
+          mkdir -p "$HOME/Library/Caches/pip"
+          echo "marker-$GITHUB_RUN_ID-A" > "$HOME/Library/Caches/pip/stamp"
+      - name: Save
+        uses: ./save
+        with:
+          audience: https://cache.buildrush.dev
+          path: ~/Library/Caches/pip
+          key: ${{ env.KEY_NS }}${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+      - name: Wipe
+        run: rm -rf "$HOME/Library/Caches/pip"
+      - id: restore-positive
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: ~/Library/Caches/pip
+          key: ${{ env.KEY_NS }}${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-pip-
+      - name: Assert hit + record primary
+        env:
+          HIT: ${{ steps.restore-positive.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-positive.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "true" || { echo "expected hit"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" "$HOME/Library/Caches/pip/stamp" || { echo "bytes mismatch"; exit 1; }
+          echo "PRIOR_PRIMARY=$MATCHED" >> "$GITHUB_ENV"
+      - name: Bump requirements.txt to B
+        run: echo 'flask==3.0.1' > requirements.txt
+      - run: rm -rf "$HOME/Library/Caches/pip"
+      - id: restore-fallback
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: ~/Library/Caches/pip
+          key: ${{ env.KEY_NS }}${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-pip-
+      - name: Assert fallback
+        env:
+          HIT: ${{ steps.restore-fallback.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-fallback.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "false" || { echo "expected miss"; exit 1; }
+          test "$MATCHED" = "$PRIOR_PRIMARY" || { echo "matched != prior primary"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" "$HOME/Library/Caches/pip/stamp" || { echo "bytes mismatch"; exit 1; }
+
+  python-pip-simple-windows:
+    name: 'compat: Python pip (simple, Windows)'
+    needs: build-dist
+    runs-on: windows-latest
+    permissions: { id-token: write, contents: read }
+    env:
+      BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}
+      KEY_NS: compat-${{ github.run_id }}-${{ github.run_attempt }}-
+    defaults: { run: { shell: bash } }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - name: Seed requirements.txt
+        run: echo 'flask==3.0.0' > requirements.txt
+      - name: Seed cache payload
+        run: |
+          mkdir -p "$HOME/AppData/Local/pip/Cache"
+          echo "marker-$GITHUB_RUN_ID-A" > "$HOME/AppData/Local/pip/Cache/stamp"
+      - name: Save
+        uses: ./save
+        with:
+          audience: https://cache.buildrush.dev
+          path: ~\AppData\Local\pip\Cache
+          key: ${{ env.KEY_NS }}${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+      - name: Wipe
+        run: rm -rf "$HOME/AppData/Local/pip/Cache"
+      - id: restore-positive
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: ~\AppData\Local\pip\Cache
+          key: ${{ env.KEY_NS }}${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-pip-
+      - name: Assert hit + record primary
+        env:
+          HIT: ${{ steps.restore-positive.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-positive.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "true" || { echo "expected hit"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" "$HOME/AppData/Local/pip/Cache/stamp" || { echo "bytes mismatch"; exit 1; }
+          echo "PRIOR_PRIMARY=$MATCHED" >> "$GITHUB_ENV"
+      - name: Bump requirements.txt to B
+        run: echo 'flask==3.0.1' > requirements.txt
+      - run: rm -rf "$HOME/AppData/Local/pip/Cache"
+      - id: restore-fallback
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: ~\AppData\Local\pip\Cache
+          key: ${{ env.KEY_NS }}${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-pip-
+      - name: Assert fallback
+        env:
+          HIT: ${{ steps.restore-fallback.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-fallback.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "false" || { echo "expected miss"; exit 1; }
+          test "$MATCHED" = "$PRIOR_PRIMARY" || { echo "matched != prior primary"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" "$HOME/AppData/Local/pip/Cache/stamp" || { echo "bytes mismatch"; exit 1; }
+
+  python-pip-conditional:
+    name: 'compat: Python pip (conditional)'
+    needs: build-dist
+    runs-on: ubuntu-latest
+    permissions: { id-token: write, contents: read }
+    env:
+      BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}
+      KEY_NS: compat-${{ github.run_id }}-${{ github.run_attempt }}-
+    defaults: { run: { shell: bash } }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - name: Seed requirements.txt
+        run: echo 'flask==3.0.0' > requirements.txt
+      - name: Seed cache payload (Linux only)
+        if: startsWith(runner.os, 'Linux')
+        run: |
+          mkdir -p "$HOME/.cache/pip"
+          echo "marker-$GITHUB_RUN_ID-A" > "$HOME/.cache/pip/stamp"
+      - name: Save (Linux)
+        if: startsWith(runner.os, 'Linux')
+        uses: ./save
+        with:
+          audience: https://cache.buildrush.dev
+          path: ~/.cache/pip
+          key: ${{ env.KEY_NS }}${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+      - name: Save (macOS)
+        if: startsWith(runner.os, 'macOS')
+        uses: ./save
+        with:
+          audience: https://cache.buildrush.dev
+          path: ~/Library/Caches/pip
+          key: ${{ env.KEY_NS }}${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+      - name: Save (Windows)
+        if: startsWith(runner.os, 'Windows')
+        uses: ./save
+        with:
+          audience: https://cache.buildrush.dev
+          path: ~\AppData\Local\pip\Cache
+          key: ${{ env.KEY_NS }}${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+      - name: Wipe (Linux)
+        if: startsWith(runner.os, 'Linux')
+        run: rm -rf "$HOME/.cache/pip"
+      - id: restore-linux
+        if: startsWith(runner.os, 'Linux')
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: ~/.cache/pip
+          key: ${{ env.KEY_NS }}${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-pip-
+      - name: Assert hit + record primary
+        if: startsWith(runner.os, 'Linux')
+        env:
+          HIT: ${{ steps.restore-linux.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-linux.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "true" || { echo "expected hit"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" "$HOME/.cache/pip/stamp" || { echo "bytes mismatch"; exit 1; }
+          echo "PRIOR_PRIMARY=$MATCHED" >> "$GITHUB_ENV"
+      - name: Bump requirements.txt to B
+        run: echo 'flask==3.0.1' > requirements.txt
+      - if: startsWith(runner.os, 'Linux')
+        run: rm -rf "$HOME/.cache/pip"
+      - id: restore-fallback-linux
+        if: startsWith(runner.os, 'Linux')
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: ~/.cache/pip
+          key: ${{ env.KEY_NS }}${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-pip-
+      - name: Assert fallback
+        if: startsWith(runner.os, 'Linux')
+        env:
+          HIT: ${{ steps.restore-fallback-linux.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-fallback-linux.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "false" || { echo "expected miss"; exit 1; }
+          test "$MATCHED" = "$PRIOR_PRIMARY" || { echo "matched != prior primary"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" "$HOME/.cache/pip/stamp" || { echo "bytes mismatch"; exit 1; }
+
+  python-pip-matrix:
+    name: 'compat: Python pip (matrix)'
+    needs: build-dist
+    runs-on: ${{ matrix.os }}
+    permissions: { id-token: write, contents: read }
+    env:
+      BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}
+      KEY_NS: compat-${{ github.run_id }}-${{ github.run_attempt }}-
+    defaults: { run: { shell: bash } }
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+        include:
+          - os: ubuntu-latest
+            path: ~/.cache/pip
+            seedpath: /home/runner/.cache/pip
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - name: Seed requirements.txt
+        run: echo 'flask==3.0.0' > requirements.txt
+      - name: Seed cache payload
+        run: |
+          mkdir -p "${{ matrix.seedpath }}"
+          echo "marker-$GITHUB_RUN_ID-A" > "${{ matrix.seedpath }}/stamp"
+      - name: Save
+        uses: ./save
+        with:
+          audience: https://cache.buildrush.dev
+          path: ${{ matrix.path }}
+          key: ${{ env.KEY_NS }}${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+      - name: Wipe
+        run: rm -rf "${{ matrix.seedpath }}"
+      - id: restore-positive
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: ${{ matrix.path }}
+          key: ${{ env.KEY_NS }}${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-pip-
+      - name: Assert hit + record primary
+        env:
+          HIT: ${{ steps.restore-positive.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-positive.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "true" || { echo "expected hit"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" "${{ matrix.seedpath }}/stamp" || { echo "bytes mismatch"; exit 1; }
+          echo "PRIOR_PRIMARY=$MATCHED" >> "$GITHUB_ENV"
+      - name: Bump requirements.txt to B
+        run: echo 'flask==3.0.1' > requirements.txt
+      - run: rm -rf "${{ matrix.seedpath }}"
+      - id: restore-fallback
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: ${{ matrix.path }}
+          key: ${{ env.KEY_NS }}${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-pip-
+      - name: Assert fallback
+        env:
+          HIT: ${{ steps.restore-fallback.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-fallback.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "false" || { echo "expected miss"; exit 1; }
+          test "$MATCHED" = "$PRIOR_PRIMARY" || { echo "matched != prior primary"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" "${{ matrix.seedpath }}/stamp" || { echo "bytes mismatch"; exit 1; }
+
+  python-pip-cmd-linux:
+    name: 'compat: Python pip (cmd, Linux)'
+    needs: build-dist
+    runs-on: ubuntu-latest
+    permissions: { id-token: write, contents: read }
+    env:
+      BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}
+      KEY_NS: compat-${{ github.run_id }}-${{ github.run_attempt }}-
+    defaults: { run: { shell: bash } }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - id: pip-cache
+        name: Stub pip cache directory
+        run: |
+          mkdir -p "$HOME/.cache/pip"
+          echo "dir=$HOME/.cache/pip" >> $GITHUB_OUTPUT
+      - name: Seed requirements.txt
+        run: echo 'flask==3.0.0' > requirements.txt
+      - name: Seed cache payload
+        run: echo "marker-$GITHUB_RUN_ID-A" > "$HOME/.cache/pip/stamp"
+      - name: Save
+        uses: ./save
+        with:
+          audience: https://cache.buildrush.dev
+          path: ${{ steps.pip-cache.outputs.dir }}
+          key: ${{ env.KEY_NS }}${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+      - name: Wipe
+        run: rm -rf "$HOME/.cache/pip"
+      - id: restore-positive
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: ${{ steps.pip-cache.outputs.dir }}
+          key: ${{ env.KEY_NS }}${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-pip-
+      - name: Assert hit + record primary
+        env:
+          HIT: ${{ steps.restore-positive.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-positive.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "true" || { echo "expected hit"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" "$HOME/.cache/pip/stamp" || { echo "bytes mismatch"; exit 1; }
+          echo "PRIOR_PRIMARY=$MATCHED" >> "$GITHUB_ENV"
+      - name: Bump requirements.txt to B
+        run: echo 'flask==3.0.1' > requirements.txt
+      - run: rm -rf "$HOME/.cache/pip"
+      - id: restore-fallback
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: ${{ steps.pip-cache.outputs.dir }}
+          key: ${{ env.KEY_NS }}${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-pip-
+      - name: Assert fallback
+        env:
+          HIT: ${{ steps.restore-fallback.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-fallback.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "false" || { echo "expected miss"; exit 1; }
+          test "$MATCHED" = "$PRIOR_PRIMARY" || { echo "matched != prior primary"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" "$HOME/.cache/pip/stamp" || { echo "bytes mismatch"; exit 1; }
+
+  python-pip-cmd-macos:
+    name: 'compat: Python pip (cmd, macOS)'
+    needs: build-dist
+    runs-on: macos-latest
+    permissions: { id-token: write, contents: read }
+    env:
+      BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}
+      KEY_NS: compat-${{ github.run_id }}-${{ github.run_attempt }}-
+    defaults: { run: { shell: bash } }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - id: pip-cache
+        name: Stub pip cache directory
+        run: |
+          mkdir -p "$HOME/Library/Caches/pip"
+          echo "dir=$HOME/Library/Caches/pip" >> $GITHUB_OUTPUT
+      - name: Seed requirements.txt
+        run: echo 'flask==3.0.0' > requirements.txt
+      - name: Seed cache payload
+        run: echo "marker-$GITHUB_RUN_ID-A" > "$HOME/Library/Caches/pip/stamp"
+      - name: Save
+        uses: ./save
+        with:
+          audience: https://cache.buildrush.dev
+          path: ${{ steps.pip-cache.outputs.dir }}
+          key: ${{ env.KEY_NS }}${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+      - name: Wipe
+        run: rm -rf "$HOME/Library/Caches/pip"
+      - id: restore-positive
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: ${{ steps.pip-cache.outputs.dir }}
+          key: ${{ env.KEY_NS }}${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-pip-
+      - name: Assert hit + record primary
+        env:
+          HIT: ${{ steps.restore-positive.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-positive.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "true" || { echo "expected hit"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" "$HOME/Library/Caches/pip/stamp" || { echo "bytes mismatch"; exit 1; }
+          echo "PRIOR_PRIMARY=$MATCHED" >> "$GITHUB_ENV"
+      - name: Bump requirements.txt to B
+        run: echo 'flask==3.0.1' > requirements.txt
+      - run: rm -rf "$HOME/Library/Caches/pip"
+      - id: restore-fallback
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: ${{ steps.pip-cache.outputs.dir }}
+          key: ${{ env.KEY_NS }}${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-pip-
+      - name: Assert fallback
+        env:
+          HIT: ${{ steps.restore-fallback.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-fallback.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "false" || { echo "expected miss"; exit 1; }
+          test "$MATCHED" = "$PRIOR_PRIMARY" || { echo "matched != prior primary"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" "$HOME/Library/Caches/pip/stamp" || { echo "bytes mismatch"; exit 1; }
+
+  python-pip-cmd-windows:
+    name: 'compat: Python pip (cmd, Windows)'
+    needs: build-dist
+    runs-on: windows-latest
+    permissions: { id-token: write, contents: read }
+    env:
+      BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}
+      KEY_NS: compat-${{ github.run_id }}-${{ github.run_attempt }}-
+    defaults: { run: { shell: bash } }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - id: pip-cache
+        name: Stub pip cache directory
+        # Upstream cmd-shell example expects `pip cache dir` to emit a native
+        # Windows path (e.g. C:\Users\runneradmin\AppData\Local\pip\Cache). We
+        # synthesize the same form here so the action sees a real path it can
+        # resolve on Windows — not the Git Bash MSYS form (/c/Users/...).
+        run: |
+          mkdir -p "$HOME/AppData/Local/pip/Cache"
+          echo "dir=$(cygpath -w "$HOME/AppData/Local/pip/Cache")" >> $GITHUB_OUTPUT
+      - name: Seed requirements.txt
+        run: echo 'flask==3.0.0' > requirements.txt
+      - name: Seed cache payload
+        run: echo "marker-$GITHUB_RUN_ID-A" > "$HOME/AppData/Local/pip/Cache/stamp"
+      - name: Save
+        uses: ./save
+        with:
+          audience: https://cache.buildrush.dev
+          path: ${{ steps.pip-cache.outputs.dir }}
+          key: ${{ env.KEY_NS }}${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+      - name: Wipe
+        run: rm -rf "$HOME/AppData/Local/pip/Cache"
+      - id: restore-positive
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: ${{ steps.pip-cache.outputs.dir }}
+          key: ${{ env.KEY_NS }}${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-pip-
+      - name: Assert hit + record primary
+        env:
+          HIT: ${{ steps.restore-positive.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-positive.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "true" || { echo "expected hit"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" "$HOME/AppData/Local/pip/Cache/stamp" || { echo "bytes mismatch"; exit 1; }
+          echo "PRIOR_PRIMARY=$MATCHED" >> "$GITHUB_ENV"
+      - name: Bump requirements.txt to B
+        run: echo 'flask==3.0.1' > requirements.txt
+      - run: rm -rf "$HOME/AppData/Local/pip/Cache"
+      - id: restore-fallback
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: ${{ steps.pip-cache.outputs.dir }}
+          key: ${{ env.KEY_NS }}${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-pip-
+      - name: Assert fallback
+        env:
+          HIT: ${{ steps.restore-fallback.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-fallback.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "false" || { echo "expected miss"; exit 1; }
+          test "$MATCHED" = "$PRIOR_PRIMARY" || { echo "matched != prior primary"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" "$HOME/AppData/Local/pip/Cache/stamp" || { echo "bytes mismatch"; exit 1; }
+
+  swift-carthage:
+    name: 'compat: Swift Carthage'
+    needs: build-dist
+    runs-on: ubuntu-latest
+    permissions: { id-token: write, contents: read }
+    env:
+      BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}
+      KEY_NS: compat-${{ github.run_id }}-${{ github.run_attempt }}-
+    defaults: { run: { shell: bash } }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - name: Seed Cartfile.resolved (hash A)
+        run: echo 'foo == 1.0.0' > Cartfile.resolved
+      - name: Seed cache payload
+        run: |
+          mkdir -p Carthage
+          echo "marker-$GITHUB_RUN_ID-A" > Carthage/stamp
+      - name: Save
+        uses: ./save
+        with:
+          audience: https://cache.buildrush.dev
+          path: Carthage
+          key: ${{ env.KEY_NS }}${{ runner.os }}-carthage-${{ hashFiles('**/Cartfile.resolved') }}
+      - name: Wipe
+        run: rm -rf Carthage
+      - id: restore-positive
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: Carthage
+          key: ${{ env.KEY_NS }}${{ runner.os }}-carthage-${{ hashFiles('**/Cartfile.resolved') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-carthage-
+      - name: Assert hit + record primary
+        env:
+          HIT: ${{ steps.restore-positive.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-positive.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "true" || { echo "expected hit"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" Carthage/stamp || { echo "bytes mismatch"; exit 1; }
+          echo "PRIOR_PRIMARY=$MATCHED" >> "$GITHUB_ENV"
+      - name: Bump Cartfile.resolved to B
+        run: echo 'foo == 1.0.1' > Cartfile.resolved
+      - run: rm -rf Carthage
+      - id: restore-fallback
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: Carthage
+          key: ${{ env.KEY_NS }}${{ runner.os }}-carthage-${{ hashFiles('**/Cartfile.resolved') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-carthage-
+      - name: Assert fallback
+        env:
+          HIT: ${{ steps.restore-fallback.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-fallback.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "false" || { echo "expected miss"; exit 1; }
+          test "$MATCHED" = "$PRIOR_PRIMARY" || { echo "matched != prior primary"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" Carthage/stamp || { echo "bytes mismatch"; exit 1; }
+
+  swift-cocoapods:
+    name: 'compat: Swift CocoaPods'
+    needs: build-dist
+    runs-on: ubuntu-latest
+    permissions: { id-token: write, contents: read }
+    env:
+      BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}
+      KEY_NS: compat-${{ github.run_id }}-${{ github.run_attempt }}-
+    defaults: { run: { shell: bash } }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - name: Seed Podfile.lock (hash A)
+        run: |
+          cat > Podfile.lock << 'EOF'
+          PODS:
+            - foo (1.0.0)
+          EOF
+      - name: Seed cache payload
+        run: |
+          mkdir -p Pods
+          echo "marker-$GITHUB_RUN_ID-A" > Pods/stamp
+      - name: Save
+        uses: ./save
+        with:
+          audience: https://cache.buildrush.dev
+          path: Pods
+          key: ${{ env.KEY_NS }}${{ runner.os }}-pods-${{ hashFiles('**/Podfile.lock') }}
+      - name: Wipe
+        run: rm -rf Pods
+      - id: restore-positive
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: Pods
+          key: ${{ env.KEY_NS }}${{ runner.os }}-pods-${{ hashFiles('**/Podfile.lock') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-pods-
+      - name: Assert hit + record primary
+        env:
+          HIT: ${{ steps.restore-positive.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-positive.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "true" || { echo "expected hit"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" Pods/stamp || { echo "bytes mismatch"; exit 1; }
+          echo "PRIOR_PRIMARY=$MATCHED" >> "$GITHUB_ENV"
+      - name: Bump Podfile.lock to B
+        run: |
+          cat > Podfile.lock << 'EOF'
+          PODS:
+            - foo (1.0.1)
+          EOF
+      - run: rm -rf Pods
+      - id: restore-fallback
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: Pods
+          key: ${{ env.KEY_NS }}${{ runner.os }}-pods-${{ hashFiles('**/Podfile.lock') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-pods-
+      - name: Assert fallback
+        env:
+          HIT: ${{ steps.restore-fallback.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-fallback.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "false" || { echo "expected miss"; exit 1; }
+          test "$MATCHED" = "$PRIOR_PRIMARY" || { echo "matched != prior primary"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" Pods/stamp || { echo "bytes mismatch"; exit 1; }
+
+  swift-spm:
+    name: 'compat: Swift SPM'
+    needs: build-dist
+    runs-on: ubuntu-latest
+    permissions: { id-token: write, contents: read }
+    env:
+      BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}
+      KEY_NS: compat-${{ github.run_id }}-${{ github.run_attempt }}-
+    defaults: { run: { shell: bash } }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - name: Seed Package.resolved (hash A)
+        run: echo '{"pins":[]}' > Package.resolved
+      - name: Seed cache payload
+        run: |
+          mkdir -p .build
+          echo "marker-$GITHUB_RUN_ID-A" > .build/stamp
+      - name: Save
+        uses: ./save
+        with:
+          audience: https://cache.buildrush.dev
+          path: .build
+          key: ${{ env.KEY_NS }}${{ runner.os }}-spm-${{ hashFiles('**/Package.resolved') }}
+      - name: Wipe
+        run: rm -rf .build
+      - id: restore-positive
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: .build
+          key: ${{ env.KEY_NS }}${{ runner.os }}-spm-${{ hashFiles('**/Package.resolved') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-spm-
+      - name: Assert hit + record primary
+        env:
+          HIT: ${{ steps.restore-positive.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-positive.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "true" || { echo "expected hit"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" .build/stamp || { echo "bytes mismatch"; exit 1; }
+          echo "PRIOR_PRIMARY=$MATCHED" >> "$GITHUB_ENV"
+      - name: Bump Package.resolved to B
+        run: echo '{"pins":[{"name":"foo"}]}' > Package.resolved
+      - run: rm -rf .build
+      - id: restore-fallback
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: .build
+          key: ${{ env.KEY_NS }}${{ runner.os }}-spm-${{ hashFiles('**/Package.resolved') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-spm-
+      - name: Assert fallback
+        env:
+          HIT: ${{ steps.restore-fallback.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-fallback.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "false" || { echo "expected miss"; exit 1; }
+          test "$MATCHED" = "$PRIOR_PRIMARY" || { echo "matched != prior primary"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" .build/stamp || { echo "bytes mismatch"; exit 1; }
+
+  swift-mint:
+    name: 'compat: Swift Mint'
+    needs: build-dist
+    runs-on: ubuntu-latest
+    permissions: { id-token: write, contents: read }
+    env:
+      BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}
+      KEY_NS: compat-${{ github.run_id }}-${{ github.run_attempt }}-
+      MINT_PATH: .mint/lib
+      MINT_LINK_PATH: .mint/bin
+    defaults: { run: { shell: bash } }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - name: Seed Mintfile (hash A)
+        run: echo 'org/foo@1.0.0' > Mintfile
+      - name: Seed cache payload
+        run: |
+          mkdir -p .mint
+          echo "marker-$GITHUB_RUN_ID-A" > .mint/stamp
+      - name: Save
+        uses: ./save
+        with:
+          audience: https://cache.buildrush.dev
+          path: .mint
+          key: ${{ env.KEY_NS }}${{ runner.os }}-mint-${{ hashFiles('**/Mintfile') }}
+      - name: Wipe
+        run: rm -rf .mint
+      - id: restore-positive
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: .mint
+          key: ${{ env.KEY_NS }}${{ runner.os }}-mint-${{ hashFiles('**/Mintfile') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-mint-
+      - name: Assert hit + record primary
+        env:
+          HIT: ${{ steps.restore-positive.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-positive.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "true" || { echo "expected hit"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" .mint/stamp || { echo "bytes mismatch"; exit 1; }
+          echo "PRIOR_PRIMARY=$MATCHED" >> "$GITHUB_ENV"
+      - name: Bump Mintfile to B
+        run: echo 'org/foo@1.0.1' > Mintfile
+      - run: rm -rf .mint
+      - id: restore-fallback
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: .mint
+          key: ${{ env.KEY_NS }}${{ runner.os }}-mint-${{ hashFiles('**/Mintfile') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ runner.os }}-mint-
+      - name: Assert fallback
+        env:
+          HIT: ${{ steps.restore-fallback.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-fallback.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "false" || { echo "expected miss"; exit 1; }
+          test "$MATCHED" = "$PRIOR_PRIMARY" || { echo "matched != prior primary"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" .mint/stamp || { echo "bytes mismatch"; exit 1; }
+
+  r-renv:
+    name: 'compat: R renv'
+    needs: build-dist
+    runs-on: ubuntu-latest
+    permissions: { id-token: write, contents: read }
+    env:
+      BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}
+      KEY_NS: compat-${{ github.run_id }}-${{ github.run_attempt }}-
+      # Upstream example uses ${{ runner.temp }}/renv but the `runner` context
+      # is not available in job-level env (only in steps). Use a workspace
+      # subdir so the env var resolves at validation time.
+      RENV_PATHS_ROOT: ${{ github.workspace }}/.renv-cache
+    defaults: { run: { shell: bash } }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - id: get-version
+        name: Stub R version outputs
+        run: |
+          echo "os-version=Ubuntu 24.04" >> $GITHUB_OUTPUT
+          echo "r-version=R 4.4.0" >> $GITHUB_OUTPUT
+      - name: Seed renv.lock (hash A)
+        run: echo '{"R":{"Version":"A"}}' > renv.lock
+      - name: Seed cache payload
+        run: |
+          mkdir -p "$RENV_PATHS_ROOT"
+          echo "marker-$GITHUB_RUN_ID-A" > "$RENV_PATHS_ROOT/stamp"
+      - name: Save
+        uses: ./save
+        with:
+          audience: https://cache.buildrush.dev
+          path: ${{ env.RENV_PATHS_ROOT }}
+          key: ${{ env.KEY_NS }}${{ steps.get-version.outputs.os-version }}-${{ steps.get-version.outputs.r-version }}-v0-${{ hashFiles('renv.lock') }}
+      - name: Wipe
+        run: rm -rf "$RENV_PATHS_ROOT"
+      - id: restore-positive
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: ${{ env.RENV_PATHS_ROOT }}
+          key: ${{ env.KEY_NS }}${{ steps.get-version.outputs.os-version }}-${{ steps.get-version.outputs.r-version }}-v0-${{ hashFiles('renv.lock') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ steps.get-version.outputs.os-version }}-${{ steps.get-version.outputs.r-version }}-v0-
+      - name: Assert hit + record primary
+        env:
+          HIT: ${{ steps.restore-positive.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-positive.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "true" || { echo "expected hit, got $HIT"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" "$RENV_PATHS_ROOT/stamp" || { echo "bytes mismatch"; exit 1; }
+          echo "PRIOR_PRIMARY=$MATCHED" >> "$GITHUB_ENV"
+      - name: Bump renv.lock to B
+        run: echo '{"R":{"Version":"B"}}' > renv.lock
+      - run: rm -rf "$RENV_PATHS_ROOT"
+      - id: restore-fallback
+        uses: ./restore
+        with:
+          audience: https://cache.buildrush.dev
+          path: ${{ env.RENV_PATHS_ROOT }}
+          key: ${{ env.KEY_NS }}${{ steps.get-version.outputs.os-version }}-${{ steps.get-version.outputs.r-version }}-v0-${{ hashFiles('renv.lock') }}
+          restore-keys: |
+            ${{ env.KEY_NS }}${{ steps.get-version.outputs.os-version }}-${{ steps.get-version.outputs.r-version }}-v0-
+      - name: Assert fallback
+        env:
+          HIT: ${{ steps.restore-fallback.outputs.cache-hit }}
+          MATCHED: ${{ steps.restore-fallback.outputs.cache-matched-key }}
+        run: |
+          test "$HIT" = "false" || { echo "expected miss"; exit 1; }
+          test "$MATCHED" = "$PRIOR_PRIMARY" || { echo "matched != prior primary"; exit 1; }
+          grep -q "marker-$GITHUB_RUN_ID-A" "$RENV_PATHS_ROOT/stamp" || { echo "bytes mismatch"; exit 1; }
