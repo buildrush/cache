@@ -36,6 +36,19 @@ vi.mock("../../src/archive/tar.js", () => ({
   }),
 }));
 
+// Pass-through expandGlobs so the test asserts the tilde→tar contract
+// without filesystem dependency. Real glob behavior is covered end-to-end
+// in __tests__/archive/paths.test.ts and __tests__/archive/tar.test.ts.
+vi.mock("../../src/archive/paths.js", async () => {
+  const actual = await vi.importActual<
+    typeof import("../../src/archive/paths.js")
+  >("../../src/archive/paths.js");
+  return {
+    ...actual,
+    expandGlobs: vi.fn(async (paths: string[]) => paths),
+  };
+});
+
 // compressStream returns a fresh Transform (PassThrough) so a real
 // node:stream/promises `pipeline()` carries bytes through:
 //   tarStream (PassThrough, ends immediately) → compressStream
