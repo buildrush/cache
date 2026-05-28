@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.2](https://github.com/buildrush/cache/compare/v1.1.1...v1.1.2) (2026-05-28)
+
+
+### Bug Fixes
+
+* expand leading ~ in path input before tar pack ([#9](https://github.com/buildrush/cache/issues/9)) ([50d39fb](https://github.com/buildrush/cache/commit/50d39fb7d6b8af8700b19e42d4ec00670b514a40))
+
 ## [1.1.1](https://github.com/buildrush/cache/compare/v1.1.0...v1.1.1) (2026-05-28)
 
 
