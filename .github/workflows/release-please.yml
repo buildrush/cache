@@ -14,8 +14,6 @@ jobs:
     steps:
       - uses: googleapis/release-please-action@v5
         id: release
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Checkout for major tag update
         if: ${{ steps.release.outputs.release_created }}
