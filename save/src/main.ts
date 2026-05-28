@@ -13,6 +13,7 @@ import {
 } from "../../src/client/cacheClient.js";
 import { computeCacheVersion } from "../../src/archive/version.js";
 import { compressStream } from "../../src/archive/compress.js";
+import { expandHomeTilde } from "../../src/archive/paths.js";
 import { createTarStream } from "../../src/archive/tar.js";
 import { chooseUploadMode, putSingleShot, putChunked } from "../../src/transport/upload.js";
 
@@ -88,8 +89,11 @@ export async function run(): Promise<void> {
   try {
     const outHandle = await fs.open(archivePath, "w");
     try {
+      // Expand `~` so node-tar can find the source dirs. `paths` itself
+      // stays literal so computeCacheVersion's digest remains stable
+      // across runners (see src/archive/version.ts header comment).
       await pipeline(
-        createTarStream(paths, process.cwd()),
+        createTarStream(expandHomeTilde(paths), process.cwd()),
         compressStream(),
         outHandle.createWriteStream(),
       );
