@@ -16,6 +16,13 @@ import { computeCacheVersion } from "../../src/archive/version.js";
 import { decompressStream } from "../../src/archive/compress.js";
 import { extractTarStream } from "../../src/archive/tar.js";
 import { downloadToFile } from "../../src/transport/download.js";
+import {
+  formatBytes,
+  formatDuration,
+  formatSpeed,
+  shortVersion,
+} from "../../src/log/format.js";
+import { Timer } from "../../src/log/timer.js";
 
 const SUCCESS_NOTICE = "Build_Rush cache authenticated";
 const DEFAULT_BASE_URL = "https://cache.buildrush.io";
@@ -80,6 +87,7 @@ export async function run(): Promise<void> {
   const baseUrl = process.env.BUILDRUSH_CACHE_URL || DEFAULT_BASE_URL;
   const client = new CacheClient(baseUrl, token);
   const version = computeCacheVersion(paths, "zstd", enableCrossOsArchive);
+  core.info(`Cache version: ${shortVersion(version)}`);
 
   let hit: LookupHit | null;
   try {
@@ -103,6 +111,9 @@ export async function run(): Promise<void> {
   }
 
   if (!hit) {
+    core.info(
+      `Cache not found for input keys: ${[primaryKey, ...restoreKeys].join(", ")}`,
+    );
     core.setOutput("cache-hit", "false");
     core.setOutput("cache-matched-key", "");
     if (failOnCacheMiss) {
@@ -115,6 +126,7 @@ export async function run(): Promise<void> {
 
   core.setOutput("cache-matched-key", hit.matchedKey);
   core.setOutput("cache-hit", String(hit.matchedKey === primaryKey));
+  core.info(`Cache restored from key: ${hit.matchedKey}`);
 
   if (lookupOnly) return;
 
@@ -123,8 +135,17 @@ export async function run(): Promise<void> {
   const archivePath = path.join(tmpDir, "cache.tar.zst");
   const tarPath = path.join(tmpDir, "cache.tar");
   try {
+    const downloadTimer = new Timer();
     await downloadToFile(hit.downloadUrl, archivePath);
+    const downloadMs = downloadTimer.elapsedMs();
+    const downloadedBytes = (await fs.stat(archivePath)).size;
+    const speed = formatSpeed(downloadedBytes, downloadMs);
+    const tail = speed === "" ? "" : ` (${speed})`;
+    core.info(
+      `Downloaded ${formatBytes(downloadedBytes)} in ${formatDuration(downloadMs)}${tail}`,
+    );
 
+    const extractTimer = new Timer();
     // Decompress the downloaded archive to a plain tar, then extract.
     // `await using` makes the file handles leak-proof against any exception
     // between the two opens or during pipeline().
@@ -137,6 +158,8 @@ export async function run(): Promise<void> {
     );
 
     await extractTarStream(tarPath, process.cwd());
+    core.info(`Extracted in ${formatDuration(extractTimer.elapsedMs())}`);
+    core.info("Cache restored successfully");
   } catch (err) {
     core.warning(
       `Cache restore download/extract failed: ${(err as Error).message}`,

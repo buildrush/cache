@@ -44,6 +44,31 @@ vi.mock("../../src/archive/compress.js", () => ({
   compressStream: vi.fn(() => new PassThrough()),
 }));
 
+const timerHoist = vi.hoisted(() => {
+  const queue: number[] = [];
+  return {
+    queue,
+    Timer: vi.fn(function (this: unknown) {
+      return { elapsedMs: () => (queue.length > 0 ? queue.shift()! : 0) };
+    }),
+  };
+});
+
+vi.mock("../../src/log/timer.js", () => ({ Timer: timerHoist.Timer }));
+
+const countingHoist = vi.hoisted(() => ({ bytes: 0 }));
+
+vi.mock("../../src/archive/counting.js", async () => {
+  const { PassThrough } = await import("node:stream");
+  return {
+    CountingPassThrough: class StubCounter extends PassThrough {
+      get bytes() {
+        return countingHoist.bytes;
+      }
+    },
+  };
+});
+
 vi.mock("../../src/archive/version.js", () => ({
   computeCacheVersion: vi.fn(() => "computed-version"),
 }));
@@ -109,6 +134,11 @@ const booleanInputs: Record<string, boolean> = {};
 
 beforeEach(() => {
   vi.resetAllMocks();
+  timerHoist.queue.length = 0;
+  countingHoist.bytes = 0;
+  timerHoist.Timer.mockImplementation(function (this: unknown) {
+    return { elapsedMs: () => (timerHoist.queue.length > 0 ? timerHoist.queue.shift()! : 0) };
+  });
 
   for (const k of Object.keys(inputs)) delete inputs[k];
   for (const k of Object.keys(multilineInputs)) delete multilineInputs[k];
@@ -478,5 +508,59 @@ describe("save main.run() — archive + upload + finalize", () => {
       expect.any(Number),
       32 * 1024 * 1024,
     );
+  });
+
+  it("emits the five save-path info lines in order on the happy path", async () => {
+    fsStub.size = 12 * 1024 * 1024; // 12 MiB compressed
+    countingHoist.bytes = 45 * 1024 * 1024; // 45 MiB uncompressed
+    timerHoist.queue.push(2100); // upload
+    vi.mocked(mintAndExchange).mockResolvedValue({ token: "tok" });
+    cacheClientHoist.createEntry.mockResolvedValue("https://up/abc");
+    cacheClientHoist.finalizeEntry.mockResolvedValue(undefined);
+
+    await run();
+
+    const calls = vi.mocked(core.info).mock.calls.map((c) => c[0]);
+    expect(calls).toContain("Cache version: computed-ver");
+    expect(calls).toContain("Reserving cache for key: primary-key");
+    expect(
+      calls.find((s) => s.startsWith("Cache size:")),
+    ).toBe("Cache size: 12.0 MB compressed (45.0 MB uncompressed, 3.8x)");
+    expect(
+      calls.find((s) => s.startsWith("Uploaded ")),
+    ).toMatch(/Uploaded 12\.0 MB in 2\.1s \([\d.]+ MB\/s\)/);
+    expect(calls).toContain("Cache saved successfully (key: primary-key)");
+  });
+
+  it("omits compression ratio when uncompressed < 1024", async () => {
+    fsStub.size = 50; // 50 B compressed (frame overhead dominates)
+    countingHoist.bytes = 12; // 12 B uncompressed
+    timerHoist.queue.push(100);
+    vi.mocked(mintAndExchange).mockResolvedValue({ token: "tok" });
+    cacheClientHoist.createEntry.mockResolvedValue("https://up/abc");
+    cacheClientHoist.finalizeEntry.mockResolvedValue(undefined);
+
+    await run();
+
+    const calls = vi.mocked(core.info).mock.calls.map((c) => c[0]);
+    expect(
+      calls.find((s) => s.startsWith("Cache size:")),
+    ).toBe("Cache size: 50 B compressed (12 B uncompressed)");
+  });
+
+  it("ALREADY_EXISTS emits neither size nor upload nor saved-successfully lines", async () => {
+    vi.mocked(mintAndExchange).mockResolvedValue({ token: "tok" });
+    cacheClientHoist.createEntry.mockRejectedValue(
+      new CacheClientError("exists", 409, "ALREADY_EXISTS", false),
+    );
+
+    await run();
+
+    const calls = vi.mocked(core.info).mock.calls.map((c) => c[0]);
+    expect(calls.find((s) => s.startsWith("Cache size:"))).toBeUndefined();
+    expect(calls.find((s) => s.startsWith("Uploaded "))).toBeUndefined();
+    expect(
+      calls.find((s) => s.startsWith("Cache saved successfully")),
+    ).toBeUndefined();
   });
 });
