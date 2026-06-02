@@ -66,7 +66,8 @@ Drop-in surface-compatible with `actions/cache@v5`: identical input names
 
 The upstream-deprecated `save-always` input is intentionally omitted — prefer
 the split restore/save flow shown above. Build_Rush adds the BR-specific
-`audience`, `fallback`, and `buildrush-reason` extensions described below.
+`audience`, `fallback`, `verbose`, and `buildrush-reason` extensions described
+below.
 
 ## Inputs
 
@@ -81,6 +82,7 @@ the split restore/save flow shown above. Build_Rush adds the BR-specific
 | `upload-chunk-size`    | no       | `33554432` (32 MiB)           | Bytes per chunk. Applies when the cache service returns a resumable session URI (typically for archives >128 MiB). |
 | **`fallback`**         | no       | `github`                      | Build_Rush-specific. See "Fallback behavior" below.                          |
 | **`audience`**         | no       | `https://cache.buildrush.io`  | Build_Rush-specific. OIDC audience to mint. Override only for non-production cache services. |
+| **`verbose`**          | no       | `false`                       | Build_Rush-specific. Print debug-level diagnostics (HTTP statuses, retries, telemetry outcome) to the step log. |
 
 ## Outputs
 
@@ -91,7 +93,7 @@ the split restore/save flow shown above. Build_Rush adds the BR-specific
 
 ### Inputs and outputs — `buildrush/cache/restore@v1`
 
-Restore only. Same input names as `actions/cache/restore@v5` plus the two
+Restore only. Same input names as `actions/cache/restore@v5` plus the three
 Build_Rush-specific inputs.
 
 | Input                  | Required | Default                       | Notes                                |
@@ -104,6 +106,7 @@ Build_Rush-specific inputs.
 | `lookup-only`          | no       | `false`                       | Check existence without downloading. |
 | `fallback`             | no       | `github`                      | Build_Rush-specific.                  |
 | `audience`             | no       | `https://cache.buildrush.io`  | Build_Rush-specific.                  |
+| `verbose`              | no       | `false`                       | Build_Rush-specific. Verbose debug logging. |
 
 | Output              | Description                                                              |
 | ------------------- | ------------------------------------------------------------------------ |
@@ -114,7 +117,7 @@ Build_Rush-specific inputs.
 
 ### Inputs and outputs — `buildrush/cache/save@v1`
 
-Save only. Same input names as `actions/cache/save@v5` plus the two
+Save only. Same input names as `actions/cache/save@v5` plus the three
 Build_Rush-specific inputs.
 
 | Input                  | Required | Default                       | Notes                            |
@@ -125,6 +128,7 @@ Build_Rush-specific inputs.
 | `upload-chunk-size`    | no       | `33554432` (32 MiB)           | Bytes per chunk.                 |
 | `fallback`             | no       | `github`                      | Build_Rush-specific.              |
 | `audience`             | no       | `https://cache.buildrush.io`  | Build_Rush-specific.              |
+| `verbose`              | no       | `false`                       | Build_Rush-specific. Verbose debug logging. |
 
 | Output             | Description                                                              |
 | ------------------ | ------------------------------------------------------------------------ |

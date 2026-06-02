@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { pipeline } from "node:stream/promises";
 import { mintAndExchange } from "../../src/auth/exchange.js";
 import type { MintAndExchangeOptions } from "../../src/auth/exchange.js";
+import type { RestoreOutcome } from "../../src/types.js";
 import { ANNOTATION_PREFIX, applyFallback } from "../../src/auth/fallback.js";
 import { ExchangeError, isFallbackMode } from "../../src/auth/types.js";
 import {
@@ -23,11 +24,15 @@ import {
   shortVersion,
 } from "../../src/log/format.js";
 import { Timer } from "../../src/log/timer.js";
+import { debug, resolveVerbose, setVerbose } from "../../src/log/logger.js";
 
 const SUCCESS_NOTICE = "Build_Rush cache authenticated";
 const DEFAULT_BASE_URL = "https://cache.buildrush.io";
 
 export async function run(): Promise<void> {
+  // Resolve verbose first so every debug() below honors it.
+  setVerbose(resolveVerbose());
+
   // Echo cache-primary-key first so it's set even when later input validation
   // fails — preserves drop-in parity with actions/cache/restore@v5 consumers
   // that read the output after the step fails.
@@ -89,6 +94,9 @@ export async function run(): Promise<void> {
   const version = computeCacheVersion(paths, "zstd", enableCrossOsArchive);
   core.info(`Cache version: ${shortVersion(version)}`);
 
+  debug(
+    `lookup: key=${primaryKey} version=${shortVersion(version)} restore-keys=[${restoreKeys.join(", ")}]`,
+  );
   let hit: LookupHit | null;
   try {
     hit = await client.lookupEntry({
@@ -134,21 +142,33 @@ export async function run(): Promise<void> {
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "br-restore-"));
   const archivePath = path.join(tmpDir, "cache.tar.zst");
   const tarPath = path.join(tmpDir, "cache.tar");
+
+  // F1b telemetry: capture client-observed signals across every exit path.
+  // outcome starts pessimistic and is upgraded only as each phase completes.
+  let outcome: RestoreOutcome = "download_failed";
+  let clientDurationMs: number | null = null;
+  let clientBytes: number | null = null;
+  let clientThroughput: number | null = null;
+  let decompressMs: number | null = null;
+
   try {
     const downloadTimer = new Timer();
     await downloadToFile(hit.downloadUrl, archivePath);
-    const downloadMs = downloadTimer.elapsedMs();
-    const downloadedBytes = (await fs.stat(archivePath)).size;
-    const speed = formatSpeed(downloadedBytes, downloadMs);
+    clientDurationMs = downloadTimer.elapsedMs();
+    clientBytes = (await fs.stat(archivePath)).size;
+    clientThroughput =
+      clientDurationMs > 0 ? clientBytes / (clientDurationMs / 1000) : null;
+    const speed = formatSpeed(clientBytes, clientDurationMs);
     const tail = speed === "" ? "" : ` (${speed})`;
     core.info(
-      `Downloaded ${formatBytes(downloadedBytes)} in ${formatDuration(downloadMs)}${tail}`,
+      `Downloaded ${formatBytes(clientBytes)} in ${formatDuration(clientDurationMs)}${tail}`,
     );
+
+    // Download succeeded — any failure beyond here is an extract failure.
+    outcome = "extract_failed";
 
     const extractTimer = new Timer();
     // Decompress the downloaded archive to a plain tar, then extract.
-    // `await using` makes the file handles leak-proof against any exception
-    // between the two opens or during pipeline().
     await using inHandle = await fs.open(archivePath, "r");
     await using outHandle = await fs.open(tarPath, "w");
     await pipeline(
@@ -158,7 +178,9 @@ export async function run(): Promise<void> {
     );
 
     await extractTarStream(tarPath, process.cwd());
-    core.info(`Extracted in ${formatDuration(extractTimer.elapsedMs())}`);
+    decompressMs = extractTimer.elapsedMs(); // decompress+extract combined (design §5)
+    outcome = "ok";
+    core.info(`Extracted in ${formatDuration(decompressMs)}`);
     core.info("Cache restored successfully");
   } catch (err) {
     core.warning(
@@ -171,5 +193,27 @@ export async function run(): Promise<void> {
     }
   } finally {
     await fs.rm(tmpDir, { recursive: true, force: true });
+    // F1b: best-effort telemetry — must never throw into the cache step.
+    try {
+      await client.reportTelemetry({
+        key: primaryKey,
+        version,
+        matchedKey: hit.matchedKey,
+        // Durations cross the wire as integer milliseconds (cache_event_log
+        // BIGINT / Go *int64). Timer.elapsedMs() is a sub-millisecond float, so
+        // round before sending — the service's strict JSON decoder rejects a
+        // fractional number into int64 with a 400, which this best-effort path
+        // would silently swallow (no telemetry row would persist).
+        clientDurationMs:
+          clientDurationMs === null ? null : Math.round(clientDurationMs),
+        clientBytes,
+        clientThroughput,
+        decompressMs: decompressMs === null ? null : Math.round(decompressMs),
+        outcome,
+      });
+      debug(`telemetry: reported outcome=${outcome}`);
+    } catch (err) {
+      debug(`telemetry: post failed (ignored): ${(err as Error).message}`);
+    }
   }
 }

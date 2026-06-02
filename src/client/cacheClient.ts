@@ -5,6 +5,7 @@
 // are retried with exponential backoff before bubbling to the caller.
 
 import { withRetry } from "../retry/retry.js";
+import { debug } from "../log/logger.js";
 import type {
   CreateRequest,
   CreateResponse,
@@ -12,6 +13,7 @@ import type {
   FinalizeRequest,
   LookupRequest,
   LookupResponse,
+  TelemetryRequest,
 } from "../types.js";
 
 export class CacheClientError extends Error {
@@ -28,12 +30,20 @@ export class CacheClientError extends Error {
 }
 
 const DEFAULT_BASE_DELAY_MS = 200;
+const DEFAULT_TELEMETRY_TIMEOUT_MS = 2500;
 
 export interface CacheClientOptions {
   /** Override fetch for tests. */
   fetchImpl?: typeof fetch;
   /** Override retry base delay in milliseconds. Defaults to 200; tests typically pass 1 to keep the suite fast. */
   baseDelayMs?: number;
+  /**
+   * Hard per-call deadline for the best-effort telemetry POST, in
+   * milliseconds. Defaults to 2500. Telemetry is single-attempt and bounded
+   * by this timeout so a hung endpoint can never stall the cache step; tests
+   * pass a small value to exercise the abort path quickly.
+   */
+  telemetryTimeoutMs?: number;
 }
 
 export interface LookupHit {
@@ -43,6 +53,7 @@ export interface LookupHit {
 
 export class CacheClient {
   private readonly fetchImpl: typeof fetch;
+  private readonly telemetryTimeoutMs: number;
   private readonly retryOpts: {
     maxAttempts: number;
     baseDelayMs: number;
@@ -55,12 +66,28 @@ export class CacheClient {
     opts: CacheClientOptions = {},
   ) {
     this.fetchImpl = opts.fetchImpl ?? globalThis.fetch;
+    this.telemetryTimeoutMs =
+      opts.telemetryTimeoutMs ?? DEFAULT_TELEMETRY_TIMEOUT_MS;
     this.retryOpts = {
       maxAttempts: 3,
       baseDelayMs: opts.baseDelayMs ?? DEFAULT_BASE_DELAY_MS,
       isRetryable: (err: unknown) =>
         err instanceof CacheClientError && err.retryable,
     };
+  }
+
+  /**
+   * POST /api/cache/telemetry → resolves on 204. Best-effort, so unlike every
+   * other endpoint it is SINGLE-attempt (no retry budget) and hard-bounded by
+   * telemetryTimeoutMs: telemetry must never stall or fail the cache step. The
+   * CALLER wraps this in try/catch so any throw (timeout, 4xx, 5xx, network)
+   * is swallowed to a debug log.
+   */
+  async reportTelemetry(req: TelemetryRequest): Promise<void> {
+    await this.post("/api/cache/telemetry", req, {
+      expectStatus: 204,
+      timeoutMs: this.telemetryTimeoutMs,
+    });
   }
 
   /** POST /api/cache/entries → returns the uploadUrl on success. */
@@ -100,8 +127,14 @@ export class CacheClient {
   private async post(
     path: string,
     body: unknown,
-    opts: { expectStatus?: number } = {},
+    opts: { expectStatus?: number; timeoutMs?: number } = {},
   ): Promise<Response> {
+    // A hard deadline (telemetry only) aborts the fetch if the endpoint hangs;
+    // AbortSignal.timeout's timer is unref'd so it never keeps the process alive.
+    const signalInit =
+      opts.timeoutMs !== undefined
+        ? { signal: AbortSignal.timeout(opts.timeoutMs) }
+        : {};
     let resp: Response;
     try {
       resp = await this.fetchImpl(`${this.baseUrl}${path}`, {
@@ -111,6 +144,7 @@ export class CacheClient {
           Authorization: `Bearer ${this.token}`,
         },
         body: JSON.stringify(body),
+        ...signalInit,
       });
     } catch (err) {
       throw new CacheClientError(
@@ -120,6 +154,9 @@ export class CacheClient {
         true,
       );
     }
+
+    // Status only — never the URL (no secrets) or body (may carry signed URLs).
+    debug(`http: POST ${path} → ${resp.status}`);
 
     if (opts.expectStatus !== undefined) {
       if (resp.status !== opts.expectStatus) {

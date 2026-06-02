@@ -1,6 +1,7 @@
 import * as core from "@actions/core";
 import { ExchangeError } from "./types.js";
 import type { ExchangeResult } from "./types.js";
+import { debug } from "../log/logger.js";
 
 const DEFAULT_AUDIENCE = "https://cache.buildrush.io";
 const DEFAULT_EXCHANGE_URL = "https://cache.buildrush.io";
@@ -61,6 +62,8 @@ async function mintOidcToken(
       `OIDC mint failed: ${(err as Error).message}`
     );
   }
+
+  debug(`oidc: mint → ${resp.status}`);
 
   if (resp.status !== 200) {
     throw new ExchangeError(
@@ -138,6 +141,8 @@ async function exchangeToken(
       `Exchange network error: ${(err as Error).message}`
     );
   }
+
+  debug(`exchange: POST ${EXCHANGE_PATH} → ${resp.status}`);
 
   if (resp.status !== 200) {
     throw errorForStatus(resp.status);
