@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.3.0](https://github.com/buildrush/cache/compare/v1.2.0...v1.3.0) (2026-06-02)
+
+
+### Features
+
+* add verbose input and report restore telemetry ([#17](https://github.com/buildrush/cache/issues/17)) ([539d469](https://github.com/buildrush/cache/commit/539d4697ab852d9e2b6e6df504efbafe4ef917de))
+
+
+### Bug Fixes
+
+* **deps:** bump tar from 7.5.15 to 7.5.16 ([#16](https://github.com/buildrush/cache/issues/16)) ([5045ea2](https://github.com/buildrush/cache/commit/5045ea2f0d221c5a070b23a97e6a78eb255a7235))
+
 ## [1.2.0](https://github.com/buildrush/cache/compare/v1.1.2...v1.2.0) (2026-05-28)
 
 
