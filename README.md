@@ -1,6 +1,8 @@
 # buildrush/cache
 
-> Drop-in replacement for `actions/cache@v5` backed by [Build_Rush](https://buildrush.io).
+[![build-dist](https://github.com/buildrush/cache/actions/workflows/build-dist.yml/badge.svg)](https://github.com/buildrush/cache/actions/workflows/build-dist.yml)
+
+Drop-in replacement for `actions/cache@v5` backed by [Build_Rush](https://buildrush.io).
 
 Same inputs. Same outputs. Faster cache.
 
