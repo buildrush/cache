@@ -25,6 +25,7 @@ import {
   shortVersion,
 } from "../../src/log/format.js";
 import { Timer } from "../../src/log/timer.js";
+import { debug, resolveVerbose, setVerbose } from "../../src/log/logger.js";
 
 const SUCCESS_NOTICE = "Build_Rush cache authenticated";
 const DEFAULT_BASE_URL = "https://cache.buildrush.io";
@@ -45,6 +46,9 @@ function resolveChunkSize(raw: string): number {
 }
 
 export async function run(): Promise<void> {
+  // Resolve verbose first so every debug() below honors it.
+  setVerbose(resolveVerbose());
+
   // Resolve + validate inputs first so we can fail fast on bad config.
   const fallbackInput = core.getInput("fallback") || "github";
   if (!isFallbackMode(fallbackInput)) {
@@ -180,7 +184,9 @@ export async function run(): Promise<void> {
     // PUT URL uses single-shot. See chooseUploadMode for details.
     try {
       const uploadTimer = new Timer();
-      if (chooseUploadMode(uploadUrl) === "chunked") {
+      const uploadMode = chooseUploadMode(uploadUrl);
+      debug(`upload: mode=${uploadMode}, size=${sizeBytes} bytes`);
+      if (uploadMode === "chunked") {
         await putChunked(uploadUrl, archivePath, sizeBytes, chunkSize);
       } else {
         await putSingleShot(uploadUrl, archivePath, sizeBytes);

@@ -11,6 +11,7 @@ import { pipeline } from "node:stream/promises";
 import type { ReadableStream as NodeWebReadableStream } from "node:stream/web";
 import { withRetry } from "../retry/retry.js";
 import { TransportError } from "./errors.js";
+import { debug } from "../log/logger.js";
 
 export interface DownloadOptions {
   /** Override fetch for tests. Defaults to globalThis.fetch. */
@@ -56,6 +57,8 @@ export async function downloadToFile(
         true,
       );
     }
+    // Status only — never the signed URL (carries credentials).
+    debug(`download: GET → ${resp.status}`);
     if (!resp.ok) await failFromResponse(resp);
     if (!resp.body) {
       throw new TransportError("download: response has no body", resp.status, false);

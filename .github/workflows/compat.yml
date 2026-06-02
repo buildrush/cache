@@ -27,6 +27,13 @@ concurrency:
   group: compat-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: true
 
+# Verbose across the whole repo's CI: surfaces the action's debug diagnostics
+# (HTTP statuses, retries, telemetry outcome) in every job log. Set via env
+# rather than per-step `with:` so the compat jobs' `with:` blocks stay verbatim
+# from the upstream actions/cache examples (see the header note above).
+env:
+  BUILDRUSH_CACHE_VERBOSE: "true"
+
 jobs:
   build-dist:
     name: Build dist for testing

@@ -9,6 +9,7 @@ import * as fs from "node:fs";
 import { Readable } from "node:stream";
 import { TransportError } from "./errors.js";
 import { withRetry } from "../retry/retry.js";
+import { debug } from "../log/logger.js";
 
 export interface UploadOptions {
   /** Override fetch for tests. Defaults to globalThis.fetch. */
@@ -94,6 +95,8 @@ export async function putSingleShot(
         true,
       );
     }
+    // Status only — never the signed/session URL (carries credentials).
+    debug(`upload: single-shot PUT → ${resp.status}`);
     if (resp.status < 200 || resp.status >= 300) await fail(resp, "upload: PUT failed");
   }, retryOpts(opts));
 }
@@ -145,6 +148,8 @@ export async function putChunked(
           true,
         );
       }
+
+      debug(`upload: chunk ${offset}-${end}/${sizeBytes} → ${resp.status}`);
 
       if (isFinal) {
         if (resp.status !== 200 && resp.status !== 201) {

@@ -220,3 +220,86 @@ describe("CacheClient.lookupEntry", () => {
     );
   });
 });
+
+describe("CacheClient.reportTelemetry", () => {
+  const telemetry = {
+    key: "deps-Linux-x64",
+    version: "v1",
+    matchedKey: "deps-Linux-",
+    clientDurationMs: 8421,
+    clientBytes: 734003200,
+    clientThroughput: 87187000,
+    decompressMs: 1320,
+    outcome: "ok" as const,
+  };
+
+  it("posts the telemetry body + bearer with a timeout signal and resolves on 204", async () => {
+    const fetchMock = makeFetchMock();
+    fetchMock.mockResolvedValueOnce(new Response(null, { status: 204 }));
+    const client = new CacheClient(baseUrl, token, { fetchImpl: fetchMock, baseDelayMs: 1 });
+    await client.reportTelemetry(telemetry);
+    expect(fetchMock).toHaveBeenCalledWith(
+      `${baseUrl}/api/cache/telemetry`,
+      expect.objectContaining({
+        method: "POST",
+        headers: expect.objectContaining({ Authorization: "Bearer fake-jwt" }),
+        body: JSON.stringify(telemetry),
+        // Best-effort telemetry is hard-bounded by a timeout so a hung
+        // endpoint can never stall the cache step.
+        signal: expect.any(AbortSignal),
+      }),
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("throws a non-retryable CacheClientError on 400 (single attempt)", async () => {
+    const fetchMock = makeFetchMock();
+    fetchMock.mockResolvedValue(
+      jsonResponse(400, { error: { code: "VALIDATION_ERROR", message: "bad" } }),
+    );
+    const client = new CacheClient(baseUrl, token, { fetchImpl: fetchMock, baseDelayMs: 1 });
+    await expect(client.reportTelemetry(telemetry)).rejects.toMatchObject({
+      name: "CacheClientError",
+      status: 400,
+      retryable: false,
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("does NOT retry on 5xx — single attempt, unlike the other endpoints", async () => {
+    const fetchMock = makeFetchMock();
+    fetchMock.mockResolvedValue(
+      jsonResponse(503, { error: { code: "UNAVAILABLE", message: "down" } }),
+    );
+    const client = new CacheClient(baseUrl, token, { fetchImpl: fetchMock, baseDelayMs: 1 });
+    await expect(client.reportTelemetry(telemetry)).rejects.toMatchObject({
+      status: 503,
+    });
+    // Telemetry is best-effort: a single attempt, no retry budget spent.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("aborts a hung telemetry POST after the timeout and does not retry", async () => {
+    const fetchMock = makeFetchMock();
+    // Simulate a server that accepts the socket then stalls: the fetch only
+    // settles when its AbortSignal fires.
+    fetchMock.mockImplementation(
+      (_input, init) =>
+        new Promise<Response>((_resolve, reject) => {
+          const signal = (init as RequestInit | undefined)?.signal;
+          signal?.addEventListener("abort", () =>
+            reject(new DOMException("timed out", "TimeoutError")),
+          );
+        }),
+    );
+    const client = new CacheClient(baseUrl, token, {
+      fetchImpl: fetchMock,
+      telemetryTimeoutMs: 20,
+    });
+    await expect(client.reportTelemetry(telemetry)).rejects.toMatchObject({
+      name: "CacheClientError",
+      code: "NETWORK_ERROR",
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+});

@@ -47,11 +47,13 @@ vi.mock("../../src/archive/version.js", () => ({
 // vi.hoisted ref so it survives the hoisted mock factory.
 const cacheClientHoist = vi.hoisted(() => {
   const lookupEntry = vi.fn();
+  const reportTelemetry = vi.fn();
   class StubCacheClient {
     public lookupEntry = lookupEntry;
+    public reportTelemetry = reportTelemetry;
     constructor(_baseUrl: string, _token: string) {}
   }
-  return { StubCacheClient, lookupEntry };
+  return { StubCacheClient, lookupEntry, reportTelemetry };
 });
 
 vi.mock("../../src/client/cacheClient.js", async () => {
@@ -133,6 +135,9 @@ beforeEach(() => {
   vi.mocked(core.getBooleanInput).mockImplementation(
     (name: string) => booleanInputs[name] ?? false,
   );
+
+  cacheClientHoist.reportTelemetry.mockReset();
+  cacheClientHoist.reportTelemetry.mockResolvedValue(undefined);
 
   // Default: computeCacheVersion stub returns a stable string.
   vi.mocked(computeCacheVersion).mockReturnValue("computed-version");
@@ -508,5 +513,101 @@ describe("restore main.run() — verbose logging", () => {
     const calls = vi.mocked(core.info).mock.calls.map((c) => c[0]);
     const downloadedLine = calls.find((s) => s.startsWith("Downloaded "));
     expect(downloadedLine).toBe("Downloaded 12.0 MB in 8ms");
+  });
+});
+
+describe("restore main.run() — telemetry (F1b)", () => {
+  it("reports outcome=ok with measured signals on a successful restore", async () => {
+    vi.mocked(mintAndExchange).mockResolvedValue({ token: "tok" });
+    stubCacheClientLookup({ kind: "hit", downloadUrl: "https://dl/abc", matchedKey: "deps-Linux-" });
+    timerHoist.queue.push(8421, 1320);
+    vi.mocked(fs.stat).mockResolvedValue({ size: 734003200 } as Awaited<ReturnType<typeof fs.stat>>);
+
+    await run();
+
+    expect(cacheClientHoist.reportTelemetry).toHaveBeenCalledTimes(1);
+    const payload = cacheClientHoist.reportTelemetry.mock.calls[0]?.[0];
+    expect(payload).toMatchObject({
+      key: "primary-key",
+      version: "computed-version",
+      matchedKey: "deps-Linux-",
+      clientDurationMs: 8421,
+      clientBytes: 734003200,
+      decompressMs: 1320,
+      outcome: "ok",
+    });
+    expect(payload?.clientThroughput).toBeGreaterThan(0);
+  });
+
+  // Contract: telemetry durations cross the wire as INTEGER milliseconds
+  // (cache_event_log BIGINT / Go *int64). Timer.elapsedMs() returns
+  // sub-millisecond floats (hrtime.bigint()/1e6), so the action MUST round
+  // before sending — the service's strict JSON decoder rejects a fractional
+  // number into int64 with a 400, which this best-effort path silently
+  // swallows (no telemetry row persists). Sister test pins the same contract
+  // on the service side:
+  //   service/action/cache/internal/cache/telemetry_handler_test.go
+  //   (TestTelemetry_FractionalMsReturns400). If the wire contract for these
+  //   fields changes, update both tests.
+  it("rounds fractional Timer durations to integer milliseconds on the wire", async () => {
+    vi.mocked(mintAndExchange).mockResolvedValue({ token: "tok" });
+    stubCacheClientLookup({ kind: "hit", downloadUrl: "https://dl/abc", matchedKey: "deps-Linux-" });
+    // Sub-millisecond floats as Timer.elapsedMs() really produces them.
+    timerHoist.queue.push(8421.37, 1320.85);
+    vi.mocked(fs.stat).mockResolvedValue({ size: 734003200 } as Awaited<ReturnType<typeof fs.stat>>);
+
+    await run();
+
+    const payload = cacheClientHoist.reportTelemetry.mock.calls[0]?.[0];
+    // Math.round: 8421.37 → 8421 (down), 1320.85 → 1321 (up — proves rounding,
+    // not truncation). Both must be integers so the int64 decode accepts them.
+    expect(payload?.clientDurationMs).toBe(8421);
+    expect(payload?.decompressMs).toBe(1321);
+    expect(Number.isInteger(payload?.clientDurationMs)).toBe(true);
+    expect(Number.isInteger(payload?.decompressMs)).toBe(true);
+  });
+
+  it("reports outcome=download_failed when the download throws", async () => {
+    vi.mocked(mintAndExchange).mockResolvedValue({ token: "tok" });
+    stubCacheClientLookup({ kind: "hit", downloadUrl: "https://dl/abc", matchedKey: "primary-key" });
+    vi.mocked(downloadToFile).mockRejectedValue(new Error("network reset"));
+
+    await run();
+
+    expect(cacheClientHoist.reportTelemetry).toHaveBeenCalledTimes(1);
+    expect(cacheClientHoist.reportTelemetry.mock.calls[0]?.[0]).toMatchObject({
+      outcome: "download_failed",
+      clientBytes: null,
+    });
+  });
+
+  it("reports outcome=extract_failed when extraction throws", async () => {
+    vi.mocked(mintAndExchange).mockResolvedValue({ token: "tok" });
+    stubCacheClientLookup({ kind: "hit", downloadUrl: "https://dl/abc", matchedKey: "primary-key" });
+    vi.mocked(extractTarStream).mockRejectedValue(new Error("corrupt tar"));
+
+    await run();
+
+    expect(cacheClientHoist.reportTelemetry.mock.calls[0]?.[0]).toMatchObject({
+      outcome: "extract_failed",
+    });
+  });
+
+  it("does NOT report on a miss", async () => {
+    vi.mocked(mintAndExchange).mockResolvedValue({ token: "tok" });
+    stubCacheClientLookup({ kind: "miss" });
+
+    await run();
+
+    expect(cacheClientHoist.reportTelemetry).not.toHaveBeenCalled();
+  });
+
+  it("swallows a telemetry POST failure (never throws into the cache step)", async () => {
+    vi.mocked(mintAndExchange).mockResolvedValue({ token: "tok" });
+    stubCacheClientLookup({ kind: "hit", downloadUrl: "https://dl/abc", matchedKey: "primary-key" });
+    cacheClientHoist.reportTelemetry.mockRejectedValue(new Error("telemetry down"));
+
+    await expect(run()).resolves.toBeUndefined();
+    expect(core.setFailed).not.toHaveBeenCalled();
   });
 });

@@ -2,6 +2,8 @@
 // retry transient failures (5xx, 429, network errors) before surfacing them
 // to the orchestration in save/restore main.ts.
 
+import { debug } from "../log/logger.js";
+
 export class RetryError extends Error {
   constructor(
     message: string,
@@ -45,6 +47,9 @@ export async function withRetry<T>(
       }
       if (attempt >= opts.maxAttempts) break;
       const delay = opts.baseDelayMs * Math.pow(2, attempt - 1);
+      debug(
+        `retry: attempt ${attempt}/${opts.maxAttempts} failed (retryable), backing off ${delay}ms: ${(err as Error).message}`,
+      );
       await new Promise((r) => setTimeout(r, delay));
     }
   }

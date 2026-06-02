@@ -33,6 +33,10 @@ inputs:
     description: 'Build_Rush fallback policy when cache service is unavailable: github (default) | skip | fail.'
     required: false
     default: 'github'
+  verbose:
+    description: 'Build_Rush-specific. Print debug-level diagnostics to the step log (HTTP statuses, retries, telemetry outcome). Defaults to false.'
+    required: false
+    default: 'false'
 outputs:
   cache-hit:
     description: 'A boolean value to indicate an exact match was found for the primary key'
