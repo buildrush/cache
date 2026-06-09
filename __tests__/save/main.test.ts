@@ -8,6 +8,7 @@ import { computeCacheVersion } from "../../src/archive/version.js";
 import { putSingleShot, putChunked } from "../../src/transport/upload.js";
 import { createTarStream } from "../../src/archive/tar.js";
 import { compressStream } from "../../src/archive/compress.js";
+import { STATE_CACHE_MATCHED_KEY } from "../../src/state.js";
 
 // Pin os.homedir for the tilde-expansion test below; spread `actual` so
 // os.tmpdir() (used by save/src/main.ts) still returns a real path.
@@ -575,5 +576,39 @@ describe("save main.run() — archive + upload + finalize", () => {
     expect(
       calls.find((s) => s.startsWith("Cache saved successfully")),
     ).toBeUndefined();
+  });
+});
+
+describe("save main.run() — exact-hit skip", () => {
+  it("skips the save entirely when the restore step recorded an exact primary-key hit", async () => {
+    // restore recorded matchedKey == primaryKey ("primary-key").
+    vi.mocked(core.getState).mockImplementation((name: string) =>
+      name === STATE_CACHE_MATCHED_KEY ? "primary-key" : "",
+    );
+
+    await run();
+
+    expect(core.info).toHaveBeenCalledWith(
+      expect.stringContaining("not saving cache"),
+    );
+    // No auth, no archive, no reserve/upload/finalize — the whole step is skipped.
+    expect(mintAndExchange).not.toHaveBeenCalled();
+    expect(createTarStream).not.toHaveBeenCalled();
+    expect(cacheClientHoist.createEntry).not.toHaveBeenCalled();
+    expect(cacheClientHoist.finalizeEntry).not.toHaveBeenCalled();
+    expect(core.setFailed).not.toHaveBeenCalled();
+  });
+
+  it("does NOT skip when the recorded matched key differs from the primary key (prefix / cross-ref hit)", async () => {
+    vi.mocked(core.getState).mockImplementation((name: string) =>
+      name === STATE_CACHE_MATCHED_KEY ? "older-key" : "",
+    );
+    vi.mocked(mintAndExchange).mockResolvedValue({ token: "tok" });
+    cacheClientHoist.createEntry.mockResolvedValue("https://up/abc");
+    cacheClientHoist.finalizeEntry.mockResolvedValue(undefined);
+
+    await run();
+
+    expect(cacheClientHoist.createEntry).toHaveBeenCalled();
   });
 });

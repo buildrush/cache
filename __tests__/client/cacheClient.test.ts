@@ -169,6 +169,30 @@ describe("CacheClient.finalizeEntry", () => {
     // 500 is retryable, so we expect 3 attempts.
     expect(fetchMock).toHaveBeenCalledTimes(3);
   });
+
+  it("does NOT retry finalize on 429 — a quota rejection is terminal, not a rate limit", async () => {
+    const fetchMock = makeFetchMock();
+    fetchMock.mockResolvedValue(
+      jsonResponse(429, {
+        error: {
+          code: "QUOTA_EXCEEDED",
+          message: "per-repo overcommit limit exceeded",
+        },
+      }),
+    );
+    const client = new CacheClient(baseUrl, token, {
+      fetchImpl: fetchMock,
+      baseDelayMs: 1,
+    });
+    await expect(
+      client.finalizeEntry({ key: "k", version: "v", sizeBytes: 1024 }),
+    ).rejects.toMatchObject({ status: 429, code: "QUOTA_EXCEEDED" });
+    // The cache service rate-limits only createEntry; a finalize 429 is the
+    // per-repo/per-installation quota rejection, which retrying cannot clear.
+    // Retrying would also let the server's compensation delete the reservation
+    // and turn the retry into a misleading 404, so finalize must not retry 429.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("CacheClient.lookupEntry", () => {

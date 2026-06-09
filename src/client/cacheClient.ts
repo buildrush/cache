@@ -109,9 +109,27 @@ export class CacheClient {
 
   /** POST /api/cache/entries/finalize → resolves on 204. */
   async finalizeEntry(req: FinalizeRequest): Promise<void> {
-    await withRetry(async () => {
-      await this.post("/api/cache/entries/finalize", req, { expectStatus: 204 });
-    }, this.retryOpts);
+    await withRetry(
+      async () => {
+        await this.post("/api/cache/entries/finalize", req, {
+          expectStatus: 204,
+        });
+      },
+      {
+        ...this.retryOpts,
+        // A finalize 429 is the per-repo / per-installation quota (overcommit)
+        // rejection, never a rate limit — the cache service rate-limits only
+        // createEntry. Retrying cannot clear a quota breach, and a retry would
+        // let the server's saga compensation delete the reservation, turning
+        // the next attempt into a misleading 404 "reservation not found". So
+        // treat a finalize 429 as terminal and surface the real quota error to
+        // the caller immediately.
+        isRetryable: (err) =>
+          err instanceof CacheClientError &&
+          err.retryable &&
+          err.status !== 429,
+      },
+    );
   }
 
   /** POST /api/cache/entries/lookup → returns the hit or null on miss. */
