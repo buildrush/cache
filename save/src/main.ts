@@ -26,6 +26,7 @@ import {
 } from "../../src/log/format.js";
 import { Timer } from "../../src/log/timer.js";
 import { debug, resolveVerbose, setVerbose } from "../../src/log/logger.js";
+import { STATE_CACHE_MATCHED_KEY } from "../../src/state.js";
 
 const SUCCESS_NOTICE = "Build_Rush cache authenticated";
 const DEFAULT_BASE_URL = "https://cache.buildrush.io";
@@ -60,6 +61,20 @@ export async function run(): Promise<void> {
 
   const paths = core.getMultilineInput("path");
   const primaryKey = core.getInput("key");
+
+  // Skip the save entirely when the restore step recorded an EXACT primary-key
+  // hit: the entry already exists, so re-archiving and re-uploading it is
+  // wasted work (CPU + bandwidth) — actions/cache@v5 skips here too. A prefix /
+  // restore-key / cross-ref hit records a key that differs from the primary
+  // key, so those still save (the standard "restore old, save new" path).
+  const matchedKey = core.getState(STATE_CACHE_MATCHED_KEY);
+  if (matchedKey && matchedKey === primaryKey) {
+    core.info(
+      `Cache hit occurred on the primary key ${primaryKey}, not saving cache.`,
+    );
+    return;
+  }
+
   const enableCrossOsArchive = core.getBooleanInput("enableCrossOsArchive");
   const chunkSize = resolveChunkSize(core.getInput("upload-chunk-size"));
   // action.yml's `audience` input has a default of "https://cache.buildrush.io",

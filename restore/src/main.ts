@@ -25,6 +25,7 @@ import {
 } from "../../src/log/format.js";
 import { Timer } from "../../src/log/timer.js";
 import { debug, resolveVerbose, setVerbose } from "../../src/log/logger.js";
+import { STATE_CACHE_MATCHED_KEY } from "../../src/state.js";
 
 const SUCCESS_NOTICE = "Build_Rush cache authenticated";
 const DEFAULT_BASE_URL = "https://cache.buildrush.io";
@@ -134,6 +135,12 @@ export async function run(): Promise<void> {
 
   core.setOutput("cache-matched-key", hit.matchedKey);
   core.setOutput("cache-hit", String(hit.matchedKey === primaryKey));
+  // Record the matched key for the save post-action: when it equals the
+  // primary key (an exact hit) save skips re-uploading; a prefix / restore-key
+  // hit records a differing key, so the save still runs (actions/cache@v5
+  // parity). Set before the lookup-only early return so the skip applies there
+  // too.
+  core.saveState(STATE_CACHE_MATCHED_KEY, hit.matchedKey);
   core.info(`Cache restored from key: ${hit.matchedKey}`);
 
   if (lookupOnly) return;

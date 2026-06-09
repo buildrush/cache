@@ -9,6 +9,7 @@ import { computeCacheVersion } from "../../src/archive/version.js";
 import { downloadToFile } from "../../src/transport/download.js";
 import { extractTarStream } from "../../src/archive/tar.js";
 import { decompressStream } from "../../src/archive/compress.js";
+import { STATE_CACHE_MATCHED_KEY } from "../../src/state.js";
 
 vi.mock("@actions/core");
 vi.mock("../../src/auth/exchange.js");
@@ -353,6 +354,39 @@ describe("restore main.run() — lookup + restore", () => {
     expect(core.setOutput).toHaveBeenCalledWith("cache-hit", "false");
     expect(downloadToFile).toHaveBeenCalledTimes(1);
     expect(extractTarStream).toHaveBeenCalledTimes(1);
+  });
+
+  it("persists the matched key via saveState on an exact hit so the save step can skip the re-save", async () => {
+    vi.mocked(mintAndExchange).mockResolvedValue({ token: "tok" });
+    stubCacheClientLookup({
+      kind: "hit",
+      downloadUrl: "https://dl/abc",
+      matchedKey: "primary-key",
+    });
+
+    await run();
+
+    expect(core.saveState).toHaveBeenCalledWith(
+      STATE_CACHE_MATCHED_KEY,
+      "primary-key",
+    );
+  });
+
+  it("persists the (differing) matched key via saveState on a prefix hit so the save step still saves the primary key", async () => {
+    multilineInputs["restore-keys"] = ["fallback-1"];
+    vi.mocked(mintAndExchange).mockResolvedValue({ token: "tok" });
+    stubCacheClientLookup({
+      kind: "hit",
+      downloadUrl: "https://dl/abc",
+      matchedKey: "fallback-1",
+    });
+
+    await run();
+
+    expect(core.saveState).toHaveBeenCalledWith(
+      STATE_CACHE_MATCHED_KEY,
+      "fallback-1",
+    );
   });
 
   it("miss: cache-hit=false, matched-key='', no download/extract", async () => {
