@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.3.1](https://github.com/buildrush/cache/compare/v1.3.0...v1.3.1) (2026-06-09)
+
+
+### Bug Fixes
+
+* surface real finalize errors and skip re-saving on exact cache hits ([#21](https://github.com/buildrush/cache/issues/21)) ([e199fe0](https://github.com/buildrush/cache/commit/e199fe0f010917d658c404b0af6c644d22a6468b))
+
 ## [1.3.0](https://github.com/buildrush/cache/compare/v1.2.0...v1.3.0) (2026-06-02)
 
 
