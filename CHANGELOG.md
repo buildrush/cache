@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.0](https://github.com/buildrush/cache/compare/v1.3.1...v1.4.0) (2026-06-10)
+
+
+### Features
+
+* add configurable cache compression (zstd-fast default) ([#23](https://github.com/buildrush/cache/issues/23)) ([b7ea070](https://github.com/buildrush/cache/commit/b7ea07059f41f0080f6171ea4e71b4d7a2e81621))
+
 ## [1.3.1](https://github.com/buildrush/cache/compare/v1.3.0...v1.3.1) (2026-06-09)
 
 
