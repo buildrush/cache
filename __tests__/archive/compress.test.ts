@@ -4,11 +4,15 @@ import { pipeline } from "node:stream/promises";
 import {
   compressStream,
   decompressStream,
+  passthroughStream,
+  ZSTD_LEVEL,
+  ZSTD_FAST_LEVEL,
 } from "../../src/archive/compress.js";
+import type { Transform } from "node:stream";
 
 async function collectPipeline(
   source: Readable,
-  transform: ReturnType<typeof compressStream> | ReturnType<typeof decompressStream>,
+  transform: Transform,
 ): Promise<Buffer> {
   const chunks: Buffer[] = [];
   const sink = new Writable({
@@ -64,5 +68,32 @@ describe("compress/decompress", () => {
     await expect(pipeline(failing, compressStream(), sink)).rejects.toThrow(
       "upstream boom",
     );
+  });
+
+  it("exposes the documented level constants", () => {
+    expect(ZSTD_LEVEL).toBe(3);
+    expect(ZSTD_FAST_LEVEL).toBe(-4);
+  });
+
+  it("zstd-fast (-4) output decodes with the plain zstd decoder (cross-tier interop)", async () => {
+    const payload = Buffer.from("interop payload ".repeat(2000));
+    const compressed = await collectPipeline(
+      Readable.from([payload]),
+      compressStream(ZSTD_FAST_LEVEL),
+    );
+    const decompressed = await collectPipeline(
+      Readable.from([compressed]),
+      decompressStream(),
+    );
+    expect(decompressed.equals(payload)).toBe(true);
+  });
+
+  it("passthroughStream round-trips bytes unchanged (none tier)", async () => {
+    const payload = Buffer.from("raw bytes, no compression");
+    const out = await collectPipeline(
+      Readable.from([payload]),
+      passthroughStream(),
+    );
+    expect(out.equals(payload)).toBe(true);
   });
 });

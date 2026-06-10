@@ -33,6 +33,10 @@ inputs:
     description: 'Build_Rush fallback policy when cache service is unavailable: github (default) | skip | fail.'
     required: false
     default: 'github'
+  compression:
+    description: 'Build_Rush-specific. Compression for the cache archive: zstd-fast (default, fastest) | zstd (balanced, better ratio) | none (store uncompressed). zstd-fast and zstd interoperate within a key; none uses a separate cache namespace.'
+    required: false
+    default: 'zstd-fast'
   verbose:
     description: 'Build_Rush-specific. Print debug-level diagnostics to the step log (HTTP statuses, retries, telemetry outcome). Defaults to false.'
     required: false
