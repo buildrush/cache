@@ -50,4 +50,15 @@ describe("computeCacheVersion", () => {
     const b = computeCacheVersion(["b", "a"], "zstd", false, "linux");
     expect(a).not.toBe(b);
   });
+
+  it("produces a distinct hash for method 'none'", () => {
+    const got = computeCacheVersion(["node_modules"], "none", false, "linux");
+    expect(got).toBe(hash(["node_modules", "none", "1.0"]));
+  });
+
+  it("'none' and 'zstd' are different namespaces", () => {
+    const none = computeCacheVersion(["a"], "none", false, "linux");
+    const zstd = computeCacheVersion(["a"], "zstd", false, "linux");
+    expect(none).not.toBe(zstd);
+  });
 });

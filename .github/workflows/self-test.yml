@@ -421,3 +421,89 @@ jobs:
         run: |
           test "$OUTCOME" = "failure" || (echo "expected action step to fail with fallback: fail" && exit 1)
           test "$REASON" = "network-error" || (echo "got reason: $REASON" && exit 1)
+
+  compression-none:
+    name: Compression — none round-trip
+    needs: build-dist
+    runs-on: ubuntu-latest
+    permissions: { id-token: write, contents: read }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - name: Seed payload
+        env:
+          RUN_ID: ${{ github.run_id }}
+        run: mkdir -p /tmp/br-none-payload && echo "none-marker-$RUN_ID" > /tmp/br-none-payload/stamp
+      - name: Save (compression none)
+        uses: ./save
+        env:
+          BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}
+        with:
+          audience: https://cache.buildrush.dev
+          key: self-test-none-${{ github.run_id }}
+          path: /tmp/br-none-payload
+          compression: none
+      - run: rm -rf /tmp/br-none-payload
+      - name: Restore (compression none)
+        id: restore
+        uses: ./restore
+        env:
+          BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}
+        with:
+          audience: https://cache.buildrush.dev
+          key: self-test-none-${{ github.run_id }}
+          path: /tmp/br-none-payload
+          compression: none
+      - name: Assert hit and bytes match
+        env:
+          HIT: ${{ steps.restore.outputs.cache-hit }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          test "$HIT" = "true" || (echo "expected hit, got $HIT" && exit 1)
+          test -f /tmp/br-none-payload/stamp || (echo "stamp missing" && exit 1)
+          grep -q "none-marker-$RUN_ID" /tmp/br-none-payload/stamp \
+            || (echo "restored bytes do not match what was saved" && exit 1)
+
+  compression-zstd-fast:
+    name: Compression — zstd-fast round-trip
+    needs: build-dist
+    runs-on: ubuntu-latest
+    permissions: { id-token: write, contents: read }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with: { name: dist-bundle, path: dist }
+      - name: Seed payload
+        env:
+          RUN_ID: ${{ github.run_id }}
+        run: mkdir -p /tmp/br-zstdfast-payload && echo "zstdfast-marker-$RUN_ID" > /tmp/br-zstdfast-payload/stamp
+      - name: Save (compression zstd-fast)
+        uses: ./save
+        env:
+          BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}
+        with:
+          audience: https://cache.buildrush.dev
+          key: self-test-zstdfast-${{ github.run_id }}
+          path: /tmp/br-zstdfast-payload
+          compression: zstd-fast
+      - run: rm -rf /tmp/br-zstdfast-payload
+      - name: Restore (compression zstd-fast)
+        id: restore
+        uses: ./restore
+        env:
+          BUILDRUSH_CACHE_URL: ${{ vars.BUILDRUSH_CACHE_STAGING_URL }}
+        with:
+          audience: https://cache.buildrush.dev
+          key: self-test-zstdfast-${{ github.run_id }}
+          path: /tmp/br-zstdfast-payload
+          compression: zstd-fast
+      - name: Assert hit and bytes match
+        env:
+          HIT: ${{ steps.restore.outputs.cache-hit }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          test "$HIT" = "true" || (echo "expected hit, got $HIT" && exit 1)
+          test -f /tmp/br-zstdfast-payload/stamp || (echo "stamp missing" && exit 1)
+          grep -q "zstdfast-marker-$RUN_ID" /tmp/br-zstdfast-payload/stamp \
+            || (echo "restored bytes do not match what was saved" && exit 1)

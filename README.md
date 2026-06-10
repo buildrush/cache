@@ -85,6 +85,7 @@ below.
 | **`fallback`**         | no       | `github`                      | Build_Rush-specific. See "Fallback behavior" below.                          |
 | **`audience`**         | no       | `https://cache.buildrush.io`  | Build_Rush-specific. OIDC audience to mint. Override only for non-production cache services. |
 | **`verbose`**          | no       | `false`                       | Build_Rush-specific. Print debug-level diagnostics (HTTP statuses, retries, telemetry outcome) to the step log. |
+| **`compression`**      | no       | `zstd-fast`                   | Build_Rush-specific. Cache-archive compression: `zstd-fast` (fastest) \| `zstd` (balanced, better ratio) \| `none` (uncompressed). See "Compression" below. |
 
 ## Outputs
 
@@ -109,6 +110,7 @@ Build_Rush-specific inputs.
 | `fallback`             | no       | `github`                      | Build_Rush-specific.                  |
 | `audience`             | no       | `https://cache.buildrush.io`  | Build_Rush-specific.                  |
 | `verbose`              | no       | `false`                       | Build_Rush-specific. Verbose debug logging. |
+| `compression`          | no       | `zstd-fast`                   | Build_Rush-specific. `zstd-fast` \| `zstd` \| `none`. See "Compression". |
 
 | Output              | Description                                                              |
 | ------------------- | ------------------------------------------------------------------------ |
@@ -131,6 +133,7 @@ Build_Rush-specific inputs.
 | `fallback`             | no       | `github`                      | Build_Rush-specific.              |
 | `audience`             | no       | `https://cache.buildrush.io`  | Build_Rush-specific.              |
 | `verbose`              | no       | `false`                       | Build_Rush-specific. Verbose debug logging. |
+| `compression`          | no       | `zstd-fast`                   | Build_Rush-specific. `zstd-fast` \| `zstd` \| `none`. See "Compression". |
 
 | Output             | Description                                                              |
 | ------------------ | ------------------------------------------------------------------------ |
@@ -152,6 +155,21 @@ to respond:
   - Annotation: `::error::Build_Rush Cache unavailable — failing step (reason: <code>)`
 
 On success you'll see: `::notice::Using Build_Rush cache`.
+
+## Compression
+
+`compression` selects how the cache archive is compressed:
+
+| value | speed | ratio | when |
+| --- | --- | --- | --- |
+| `zstd-fast` *(default)* | fastest | good | default; best on CPU-bound runners |
+| `zstd` | fast | best | network-bound runners or very large caches, where a smaller upload/download wins |
+| `none` | n/a | none | payloads that are already compressed (images, archives), to skip wasted CPU |
+
+`zstd-fast` and `zstd` produce the **same** archive format, so they share a cache
+namespace and interoperate within a key — switching between them never invalidates
+existing caches. `none` uses a **separate** namespace: switching a workflow to or
+from `none` causes a one-time cache miss on the first run after the change.
 
 ## Reason codes
 

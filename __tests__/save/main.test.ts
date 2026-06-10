@@ -7,7 +7,7 @@ import { CacheClientError } from "../../src/client/cacheClient.js";
 import { computeCacheVersion } from "../../src/archive/version.js";
 import { putSingleShot, putChunked } from "../../src/transport/upload.js";
 import { createTarStream } from "../../src/archive/tar.js";
-import { compressStream } from "../../src/archive/compress.js";
+import { compressStream, passthroughStream } from "../../src/archive/compress.js";
 import { STATE_CACHE_MATCHED_KEY } from "../../src/state.js";
 
 // Pin os.homedir for the tilde-expansion test below; spread `actual` so
@@ -56,6 +56,10 @@ vi.mock("../../src/archive/paths.js", async () => {
 //   PassThrough → output PassThrough.
 vi.mock("../../src/archive/compress.js", () => ({
   compressStream: vi.fn(() => new PassThrough()),
+  decompressStream: vi.fn(() => new PassThrough()),
+  passthroughStream: vi.fn(() => new PassThrough()),
+  ZSTD_LEVEL: 3,
+  ZSTD_FAST_LEVEL: -4,
 }));
 
 const timerHoist = vi.hoisted(() => {
@@ -190,6 +194,7 @@ beforeEach(() => {
     return pt;
   });
   vi.mocked(compressStream).mockImplementation(() => new PassThrough());
+  vi.mocked(passthroughStream).mockImplementation(() => new PassThrough());
 
   vi.mocked(putSingleShot).mockResolvedValue(undefined);
   vi.mocked(putChunked).mockResolvedValue(undefined);
@@ -576,6 +581,42 @@ describe("save main.run() — archive + upload + finalize", () => {
     expect(
       calls.find((s) => s.startsWith("Cache saved successfully")),
     ).toBeUndefined();
+  });
+
+  it("invalid compression input → setFailed, no auth/archive/upload", async () => {
+    inputs["compression"] = "lz4";
+
+    await run();
+
+    expect(core.setFailed).toHaveBeenCalledWith(
+      expect.stringContaining("Invalid compression value"),
+    );
+    expect(mintAndExchange).not.toHaveBeenCalled();
+    expect(createTarStream).not.toHaveBeenCalled();
+    expect(cacheClientHoist.createEntry).not.toHaveBeenCalled();
+    expect(putSingleShot).not.toHaveBeenCalled();
+    expect(putChunked).not.toHaveBeenCalled();
+  });
+
+  it("default (unset) compression → computeCacheVersion called with 'zstd'", async () => {
+    vi.mocked(mintAndExchange).mockResolvedValue({ token: "tok" });
+    cacheClientHoist.createEntry.mockResolvedValue("https://up/abc");
+    cacheClientHoist.finalizeEntry.mockResolvedValue(undefined);
+
+    await run();
+
+    expect(computeCacheVersion).toHaveBeenCalledWith(["/tmp/test"], "zstd", false);
+  });
+
+  it("compression=none → computeCacheVersion called with 'none'", async () => {
+    inputs["compression"] = "none";
+    vi.mocked(mintAndExchange).mockResolvedValue({ token: "tok" });
+    cacheClientHoist.createEntry.mockResolvedValue("https://up/abc");
+    cacheClientHoist.finalizeEntry.mockResolvedValue(undefined);
+
+    await run();
+
+    expect(computeCacheVersion).toHaveBeenCalledWith(["/tmp/test"], "none", false);
   });
 });
 

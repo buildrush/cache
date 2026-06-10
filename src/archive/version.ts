@@ -7,7 +7,10 @@ import * as crypto from "node:crypto";
 
 const VERSION_SALT = "1.0";
 
-export type CompressionMethod = "zstd" | "zstd-no-long" | "gzip";
+// "zstd" | "zstd-no-long" | "gzip" mirror upstream's getCacheVersion values.
+// "none" is a Build_Rush-specific extension (no upstream equivalent), used only
+// within the BR cache namespace for the uncompressed tier.
+export type CompressionMethod = "zstd" | "zstd-no-long" | "gzip" | "none";
 
 export function computeCacheVersion(
   paths: string[],

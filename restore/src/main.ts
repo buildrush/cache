@@ -14,7 +14,11 @@ import {
   type LookupHit,
 } from "../../src/client/cacheClient.js";
 import { computeCacheVersion } from "../../src/archive/version.js";
-import { decompressStream } from "../../src/archive/compress.js";
+import {
+  DEFAULT_COMPRESSION,
+  isCompression,
+  resolveCompression,
+} from "../../src/archive/compression.js";
 import { extractTarStream } from "../../src/archive/tar.js";
 import { downloadToFile } from "../../src/transport/download.js";
 import {
@@ -57,6 +61,17 @@ export async function run(): Promise<void> {
   // so core.getInput("audience") is always non-empty in normal runs.
   const audience = core.getInput("audience");
 
+  // Build_Rush-specific: resolve + validate the compression tier (fail fast,
+  // before auth/network — same pattern as the fallback input above).
+  const compressionInput = core.getInput("compression") || DEFAULT_COMPRESSION;
+  if (!isCompression(compressionInput)) {
+    core.setFailed(
+      `Invalid compression value: '${compressionInput}'. Must be zstd-fast | zstd | none.`,
+    );
+    return;
+  }
+  const compression = resolveCompression(compressionInput);
+
   // 1. Auth — mint + exchange OIDC for a cache-service token.
   let token: string;
   try {
@@ -92,7 +107,7 @@ export async function run(): Promise<void> {
   // 2. Lookup against the Build_Rush cache service.
   const baseUrl = process.env.BUILDRUSH_CACHE_URL || DEFAULT_BASE_URL;
   const client = new CacheClient(baseUrl, token);
-  const version = computeCacheVersion(paths, "zstd", enableCrossOsArchive);
+  const version = computeCacheVersion(paths, compression.versionMethod, enableCrossOsArchive);
   core.info(`Cache version: ${shortVersion(version)}`);
 
   debug(
@@ -180,7 +195,7 @@ export async function run(): Promise<void> {
     await using outHandle = await fs.open(tarPath, "w");
     await pipeline(
       inHandle.createReadStream(),
-      decompressStream(),
+      compression.makeDecompress(),
       outHandle.createWriteStream(),
     );
 

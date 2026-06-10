@@ -8,7 +8,7 @@ import { CacheClientError } from "../../src/client/cacheClient.js";
 import { computeCacheVersion } from "../../src/archive/version.js";
 import { downloadToFile } from "../../src/transport/download.js";
 import { extractTarStream } from "../../src/archive/tar.js";
-import { decompressStream } from "../../src/archive/compress.js";
+import { decompressStream, passthroughStream } from "../../src/archive/compress.js";
 import { STATE_CACHE_MATCHED_KEY } from "../../src/state.js";
 
 vi.mock("@actions/core");
@@ -24,7 +24,11 @@ vi.mock("../../src/archive/tar.js", () => ({
 // node:stream/promises `pipeline()` can pass bytes from the input
 // PassThrough → this PassThrough → the destination PassThrough.
 vi.mock("../../src/archive/compress.js", () => ({
+  compressStream: vi.fn(() => new PassThrough()),
   decompressStream: vi.fn(() => new PassThrough()),
+  passthroughStream: vi.fn(() => new PassThrough()),
+  ZSTD_LEVEL: 3,
+  ZSTD_FAST_LEVEL: -4,
 }));
 
 const timerHoist = vi.hoisted(() => {
@@ -146,6 +150,7 @@ beforeEach(() => {
   // Default: decompress returns a fresh PassThrough Transform so a real
   // pipeline() can drive bytes from the input handle to the output handle.
   vi.mocked(decompressStream).mockImplementation(() => new PassThrough());
+  vi.mocked(passthroughStream).mockImplementation(() => new PassThrough());
 
   // Default: download + extract no-op.
   vi.mocked(downloadToFile).mockResolvedValue(undefined);
@@ -299,6 +304,42 @@ describe("restore main.run() — auth path", () => {
       if (original === undefined) delete process.env.BUILDRUSH_CACHE_URL;
       else process.env.BUILDRUSH_CACHE_URL = original;
     }
+  });
+
+  it("invalid compression input → setFailed, no auth", async () => {
+    inputs["compression"] = "lz4";
+
+    await run();
+
+    expect(core.setFailed).toHaveBeenCalledWith(
+      expect.stringContaining("Invalid compression value"),
+    );
+    expect(mintAndExchange).not.toHaveBeenCalled();
+    // cache-primary-key is echoed before any validation (drop-in parity), so it
+    // must still be emitted even when compression validation fails.
+    expect(core.setOutput).toHaveBeenCalledWith(
+      "cache-primary-key",
+      "primary-key",
+    );
+  });
+
+  it("compression=none → computeCacheVersion called with 'none'", async () => {
+    inputs["compression"] = "none";
+    vi.mocked(mintAndExchange).mockResolvedValue({ token: "tok" });
+    stubCacheClientLookup({ kind: "miss" });
+
+    await run();
+
+    expect(computeCacheVersion).toHaveBeenCalledWith(["/tmp/test"], "none", false);
+  });
+
+  it("default (unset) compression → computeCacheVersion called with 'zstd'", async () => {
+    vi.mocked(mintAndExchange).mockResolvedValue({ token: "tok" });
+    stubCacheClientLookup({ kind: "miss" });
+
+    await run();
+
+    expect(computeCacheVersion).toHaveBeenCalledWith(["/tmp/test"], "zstd", false);
   });
 });
 
